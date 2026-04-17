@@ -1,0 +1,5 @@
+numpy~=2.4.4
+trimesh~=4.11.5
+networkx~=3.6.1
+scipy~=1.17.1
+pyglet~=1.5.31
