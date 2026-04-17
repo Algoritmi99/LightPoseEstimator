@@ -27,6 +27,7 @@ class CandidatePool:
 @dataclass
 class CandidateScores:
     visibility: np.ndarray
+    external_surface: np.ndarray
     distinctiveness: np.ndarray
     geometric_usefulness: np.ndarray
     stability: np.ndarray
@@ -52,6 +53,7 @@ class MeshKeypointSelector:
         num_viewpoints: int = 240,
         neighbor_count: int = 16,
         min_visibility: float = 0.08,
+        min_external_visibility: float = 0.15,
         random_seed: Optional[int] = None,
     ) -> None:
         self.candidate_count = int(candidate_count)
@@ -59,6 +61,7 @@ class MeshKeypointSelector:
         self.num_viewpoints = int(num_viewpoints)
         self.neighbor_count = int(neighbor_count)
         self.min_visibility = float(min_visibility)
+        self.min_external_visibility = float(min_external_visibility)
         self.rng = np.random.default_rng(random_seed)
 
     def select_keypoints(
@@ -74,8 +77,6 @@ class MeshKeypointSelector:
             raise ValueError("mesh is too small to select robust keypoints")
 
         mesh = mesh.copy()
-        # mesh.remove_degenerate_faces()
-        # mesh.remove_duplicate_faces()
         mesh.remove_infinite_values()
         mesh.remove_unreferenced_vertices()
 
@@ -85,17 +86,20 @@ class MeshKeypointSelector:
 
         candidates = self._sample_candidates(mesh, self.candidate_count)
         visibility_ratio, stability_ratio = self._simulate_coverage(mesh, candidates)
+        external_surface_ratio = self._estimate_external_surface_visibility(mesh, candidates)
         distinctiveness = self._compute_distinctiveness(candidates)
         geometric_usefulness = self._compute_geometric_usefulness(candidates, mesh)
 
         total_score = (
-            0.35 * visibility_ratio
-            + 0.25 * distinctiveness
-            + 0.20 * geometric_usefulness
-            + 0.20 * stability_ratio
+            0.30 * visibility_ratio
+            + 0.20 * external_surface_ratio
+            + 0.20 * distinctiveness
+            + 0.15 * geometric_usefulness
+            + 0.15 * stability_ratio
         )
         scores = CandidateScores(
             visibility=visibility_ratio,
+            external_surface=external_surface_ratio,
             distinctiveness=distinctiveness,
             geometric_usefulness=geometric_usefulness,
             stability=stability_ratio,
@@ -318,9 +322,58 @@ class MeshKeypointSelector:
 
     def _filter_candidates(self, scores: CandidateScores) -> np.ndarray:
         vis_ok = scores.visibility >= self.min_visibility
+        ext_ok = scores.external_surface >= self.min_external_visibility
         stab_ok = scores.stability >= np.quantile(scores.stability, 0.15)
         total_ok = scores.total >= np.quantile(scores.total, 0.35)
-        return vis_ok & stab_ok & total_ok
+        return vis_ok & ext_ok & stab_ok & total_ok
+
+    def _estimate_external_surface_visibility(
+        self, mesh: trimesh.Trimesh, candidates: CandidatePool
+    ) -> np.ndarray:
+        """
+        Estimate how likely each candidate belongs to externally visible surface.
+        Uses strict ray visibility from outside views. If ray tracing backend is
+        unavailable, falls back to an outward-normal heuristic.
+        """
+        points = candidates.points
+        normals = candidates.normals
+        n = points.shape[0]
+        centroid = mesh.centroid
+        mesh_scale = max(float(mesh.scale), 1e-6)
+
+        # Conservative fallback: keep points whose normals point outward.
+        outward_dir = self._safe_normalize(points - centroid[None, :])
+        outward_score = (np.einsum("ij,ij->i", normals, outward_dir) > 0.0).astype(np.float64)
+
+        probe_views = max(24, min(96, self.num_viewpoints // 2))
+        directions = self._fibonacci_sphere(probe_views)
+        radius = 3.0 * mesh_scale
+
+        visible_count = np.zeros(n, dtype=np.float64)
+        valid_views = 0
+        ray_backend_ok = False
+
+        for view_dir in directions:
+            cam_pos = centroid + radius * view_dir
+            to_cam = cam_pos[None, :] - points
+            to_cam_dir = self._safe_normalize(to_cam)
+            facing = np.einsum("ij,ij->i", normals, to_cam_dir) > 0.05
+            if not np.any(facing):
+                continue
+
+            ray_visible = self._raycast_visible(mesh, cam_pos, points, allow_fallback=False)
+            if ray_visible is None:
+                # Ray backend unavailable in this environment.
+                continue
+
+            ray_backend_ok = True
+            visible = facing & ray_visible
+            visible_count += visible.astype(np.float64)
+            valid_views += 1
+
+        if ray_backend_ok and valid_views > 0:
+            return self._normalize(visible_count / valid_views)
+        return outward_score
 
     def _farthest_point_select(
         self, points: np.ndarray, quality: np.ndarray, k: int, mesh_scale: float
@@ -358,8 +411,12 @@ class MeshKeypointSelector:
         return np.array(selected, dtype=np.int64)
 
     def _raycast_visible(
-        self, mesh: trimesh.Trimesh, camera_position: np.ndarray, points: np.ndarray
-    ) -> np.ndarray:
+        self,
+        mesh: trimesh.Trimesh,
+        camera_position: np.ndarray,
+        points: np.ndarray,
+        allow_fallback: bool = True,
+    ) -> Optional[np.ndarray]:
         n = points.shape[0]
         origins = np.repeat(camera_position[None, :], n, axis=0)
         vec = points - origins
@@ -373,8 +430,10 @@ class MeshKeypointSelector:
                 multiple_hits=False,
             )
         except BaseException:
-            # Fallback: if robust ray tracing is unavailable, keep facing-based visibility.
-            return np.ones(n, dtype=bool)
+            # Fallback is used only for score robustness, not for strict external checks.
+            if allow_fallback:
+                return np.ones(n, dtype=bool)
+            return None
 
         visible = np.zeros(n, dtype=bool)
         if idx_ray.shape[0] == 0:
