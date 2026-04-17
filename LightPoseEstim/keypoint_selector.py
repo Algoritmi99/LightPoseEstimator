@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+from contextlib import contextmanager
 from typing import Optional
 
 import numpy as np
@@ -194,11 +196,29 @@ class MeshKeypointSelector:
         if count < 32:
             raise ValueError("candidate_count should be at least 32")
 
-        sample_count = min(count, max(128, mesh.faces.shape[0] * 2))
-        try:
-            points, face_idx = trimesh.sample.sample_surface_even(mesh, sample_count)
-        except BaseException:
-            points, face_idx = trimesh.sample.sample_surface(mesh, sample_count)
+        sample_count = count
+        points = np.empty((0, 3), dtype=np.float64)
+        face_idx = np.empty((0,), dtype=np.int64)
+
+        with self._quiet_trimesh_logs():
+            try:
+                points, face_idx = trimesh.sample.sample_surface_even(mesh, sample_count)
+            except BaseException:
+                points, face_idx = trimesh.sample.sample_surface(mesh, sample_count)
+
+            # If even sampling cannot place enough separated points, top up with
+            # regular surface sampling so downstream always sees the target count.
+            missing = sample_count - int(points.shape[0])
+            if missing > 0:
+                extra_points, extra_faces = trimesh.sample.sample_surface(mesh, missing)
+                points = np.vstack([points, extra_points])
+                face_idx = np.concatenate([face_idx, extra_faces], axis=0)
+
+        # Keep exactly requested count in a stable/randomized way.
+        if points.shape[0] > sample_count:
+            sel = self.rng.choice(points.shape[0], size=sample_count, replace=False)
+            points = points[sel]
+            face_idx = face_idx[sel]
 
         normals = mesh.face_normals[face_idx]
         normals = self._safe_normalize(normals)
@@ -212,6 +232,17 @@ class MeshKeypointSelector:
             neighbor_indices=neighbor_indices,
             local_curvature=local_curvature,
         )
+
+    @staticmethod
+    @contextmanager
+    def _quiet_trimesh_logs():
+        trimesh_logger = logging.getLogger("trimesh")
+        old_level = trimesh_logger.level
+        trimesh_logger.setLevel(logging.ERROR)
+        try:
+            yield
+        finally:
+            trimesh_logger.setLevel(old_level)
 
     def _simulate_coverage(
         self, mesh: trimesh.Trimesh, candidates: CandidatePool
