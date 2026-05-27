@@ -13,10 +13,9 @@ def main():
     loader = DataLoader(Path("/home/algoritmi/Projects/LightPoseEstimator/data/Astrobee"))
     print(len(loader.get_dataset()))
 
-    mesh = trimesh.load_mesh('~/Downloads/Astrobee v5_real.stl')
     kp_selector = MeshKeypointSelector()
-    kp = kp_selector.select_keypoints(mesh)
-    kp_selector.show_keypoints(mesh, kp)
+    kp = kp_selector.select_keypoints(loader.mesh)
+    kp_selector.show_keypoints(loader.mesh, kp)
 
 
 
