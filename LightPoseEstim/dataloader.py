@@ -1,9 +1,12 @@
 import logging
 from pathlib import Path
 from decimal import Decimal
+from PIL import Image
 
 import trimesh
 import pandas as pd
+from torch.utils.data import Dataset
+import torchvision.transforms as T
 
 from LightPoseEstim.pose import Pose
 
@@ -21,6 +24,31 @@ def _find_image(image_dir: Path, timestamp, suffix: str = "") -> list[Path]:
             if image_path.exists():
                 return [image_path]
     return []
+
+
+class ImageDataset(Dataset):
+    def __init__(self, data: pd.DataFrame):
+        self.df = data
+        self.transform = T.Compose([
+            T.ToTensor()
+        ])
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        # raw_image = Image.open(row["image"]).convert("RGB")
+        # raw_image = self.transform(raw_image)
+
+        undist_image = Image.open(row["image_undistorted"]).convert("RGB")
+        undist_image = self.transform(undist_image)
+
+        pose = row["pose"]
+
+        # return raw_image, undist_image, pose
+        return undist_image, pose
 
 
 class DataLoader:
@@ -101,10 +129,12 @@ class DataLoader:
         logger.info("Loaded %d data points from a total of %d rows in %s.", len(rows), c, self.path)
         return pd.DataFrame(rows)
 
+    def get_dataset(self):
+        return ImageDataset(self.data)
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     loader = DataLoader(Path("/home/algoritmi/Projects/LightPoseEstimator/data/Astrobee"))
-    print(len(loader.data))
-
+    print(len(loader.get_dataset()))
+    print(loader.get_dataset()[0])
