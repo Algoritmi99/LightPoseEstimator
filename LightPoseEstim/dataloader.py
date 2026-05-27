@@ -131,10 +131,3 @@ class DataLoader:
 
     def get_dataset(self):
         return ImageDataset(self.data)
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    loader = DataLoader(Path("/home/algoritmi/Projects/LightPoseEstimator/data/Astrobee"))
-    print(len(loader.get_dataset()))
-    print(loader.get_dataset()[0])
