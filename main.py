@@ -1,7 +1,7 @@
 import logging
 from pathlib import Path
 
-import trimesh
+import torchvision
 
 from LightPoseEstim.dataloader import DataLoader
 from LightPoseEstim.keypoint_selector import MeshKeypointSelector
