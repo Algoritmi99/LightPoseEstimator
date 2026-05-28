@@ -1,10 +1,8 @@
 import logging
 from pathlib import Path
 
-import torchvision
-
-from LightPoseEstim.dataloader import DataLoader
-from LightPoseEstim.keypoint_selector import MeshKeypointSelector
+from LightPoseEstim import DataLoader
+from LightPoseEstim import MeshKeypointSelector
 
 
 def main():
