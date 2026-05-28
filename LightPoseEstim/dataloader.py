@@ -1,17 +1,16 @@
+import json
 import logging
-from pathlib import Path
 from decimal import Decimal
+from pathlib import Path
 
 import cv2
 import numpy as np
-import torch
-from PIL import Image
-
-import trimesh
 import pandas as pd
-from torch.utils.data import Dataset
+import torch
 import torchvision.transforms as T
-from triton.language import dtype
+import trimesh
+from PIL import Image
+from torch.utils.data import Dataset
 
 from LightPoseEstim.pose import Pose
 from LightPoseEstim.roi import BBox, bbox_to_roi, normalize_roi
@@ -38,7 +37,7 @@ def _get_2d_roi(img_shape: tuple,
                 dist_coeffs: np.ndarray | None = None,
                 margin: float = 1.2
                 ):
-    height, width = img_shape
+    height, width = img_shape[-2:]
     bounds = mesh.bounds
     xmin, ymin, zmin = bounds[0]
     xmax, ymax, zmax = bounds[1]
@@ -163,6 +162,19 @@ class DataLoader:
         self.path = path
         self.data = self._load_data()
         self.mesh = self._load_mesh()
+        self.camera_intrinsics = self._load_camera_intrinsics()
+
+    def _load_camera_intrinsics(self):
+        json_files = list(self.path.glob("*.json"))
+
+        assert len(json_files) == 1, (
+            f"Found {len(json_files)} json files in {self.path}. Expected 1."
+        )
+
+        with open(json_files[0], "r") as f:
+            data = json.load(f)
+
+        return np.array(data["K"], dtype=np.float32)
 
     def _load_mesh(self):
         files = []
@@ -230,3 +242,6 @@ class DataLoader:
 
     def get_pose_dataset(self):
         return ImagePoseDataset(self.data)
+
+    def get_roi_dataset(self):
+        return ImageROIDataset(self.data, self.mesh, self.camera_intrinsics)
