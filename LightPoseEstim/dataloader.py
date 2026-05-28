@@ -26,7 +26,7 @@ def _find_image(image_dir: Path, timestamp, suffix: str = "") -> list[Path]:
     return []
 
 
-class ImageDataset(Dataset):
+class ImagePoseDataset(Dataset):
     def __init__(self, data: pd.DataFrame):
         self.df = data
         self.transform = T.Compose([
@@ -39,15 +39,11 @@ class ImageDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
 
-        # raw_image = Image.open(row["image"]).convert("RGB")
-        # raw_image = self.transform(raw_image)
-
         undist_image = Image.open(row["image_undistorted"]).convert("RGB")
         undist_image = self.transform(undist_image)
 
         pose = row["pose"]
 
-        # return raw_image, undist_image, pose
         return undist_image, pose
 
 
@@ -130,4 +126,4 @@ class DataLoader:
         return pd.DataFrame(rows)
 
     def get_dataset(self):
-        return ImageDataset(self.data)
+        return ImagePoseDataset(self.data)
