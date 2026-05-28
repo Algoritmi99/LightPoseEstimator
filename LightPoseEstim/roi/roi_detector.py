@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torchvision.models import mobilenet_v3_small
 
-from LightPoseEstim.roi import ROI
+from .roi import ROI
 
 
 def normalize_roi(x: torch.Tensor, roi: torch.Tensor) -> torch.Tensor:
