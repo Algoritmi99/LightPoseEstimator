@@ -125,5 +125,5 @@ class DataLoader:
         logger.info("Loaded %d data points from a total of %d rows in %s.", len(rows), c, self.path)
         return pd.DataFrame(rows)
 
-    def get_dataset(self):
+    def get_pose_dataset(self):
         return ImagePoseDataset(self.data)
