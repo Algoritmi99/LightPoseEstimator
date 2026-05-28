@@ -17,3 +17,6 @@ class BBox:
 
 def roi_to_bbox(roi: ROI) -> BBox:
     return BBox(roi.cx - roi.w / 2, roi.cy - roi.h / 2, roi.cx + roi.w / 2, roi.cy + roi.h / 2)
+
+def bbox_to_roi(bbox: BBox) -> ROI:
+    return ROI(bbox.x1 + (bbox.x2 - bbox.x1) / 2, bbox.y1 + (bbox.y2 - bbox.y1) / 2, bbox.x2 - bbox.x1, bbox.y2 - bbox.y1)

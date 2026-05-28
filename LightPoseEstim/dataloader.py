@@ -1,14 +1,20 @@
 import logging
 from pathlib import Path
 from decimal import Decimal
+
+import cv2
+import numpy as np
+import torch
 from PIL import Image
 
 import trimesh
 import pandas as pd
 from torch.utils.data import Dataset
 import torchvision.transforms as T
+from triton.language import dtype
 
 from LightPoseEstim.pose import Pose
+from LightPoseEstim.roi import BBox, bbox_to_roi, normalize_roi
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +30,59 @@ def _find_image(image_dir: Path, timestamp, suffix: str = "") -> list[Path]:
             if image_path.exists():
                 return [image_path]
     return []
+
+def _get_2d_roi(img_shape: tuple,
+                mesh: trimesh.Trimesh,
+                pose: Pose,
+                camera_intrinsics: np.ndarray,
+                dist_coeffs: np.ndarray | None = None,
+                margin: float = 1.2
+                ):
+    height, width = img_shape
+    bounds = mesh.bounds
+    xmin, ymin, zmin = bounds[0]
+    xmax, ymax, zmax = bounds[1]
+
+    bbox_3d = np.array([
+        [xmin, ymin, zmin],
+        [xmin, ymin, zmax],
+        [xmin, ymax, zmin],
+        [xmin, ymax, zmax],
+
+        [xmax, ymin, zmin],
+        [xmax, ymin, zmax],
+        [xmax, ymax, zmin],
+        [xmax, ymax, zmax],
+    ], dtype=np.float32)
+
+    dist_coeffs = dist_coeffs if dist_coeffs is not None else np.zeros((4, 1))
+
+    image_points, _ = cv2.projectPoints(
+        bbox_3d,
+        pose.get_rvec(),
+        pose.get_tvec(),
+        camera_intrinsics,
+        dist_coeffs,
+    )
+    image_points = image_points.squeeze(1)
+
+    x1 = image_points[:, 0].min()
+    x2 = image_points[:, 0].max()
+
+    y1 = image_points[:, 1].min()
+    y2 = image_points[:, 1].max()
+
+    x1 = float(np.clip(x1, 0, width - 1))
+    x2 = float(np.clip(x2, 0, width - 1))
+
+    y1 = float(np.clip(y1, 0, height - 1))
+    y2 = float(np.clip(y2, 0, height - 1))
+
+    bbox = BBox(x1, y1, x2, y2)
+    roi = bbox_to_roi(bbox)
+    roi.w *= margin
+    roi.h *= margin
+    return roi
 
 
 class ImagePoseDataset(Dataset):
@@ -47,13 +106,57 @@ class ImagePoseDataset(Dataset):
         return undist_image, pose
 
 
+class ImageROIDataset(Dataset):
+    def __init__(self, data: pd.DataFrame,
+                 mesh: trimesh.Trimesh,
+                 camera_intrinsics: np.ndarray,
+                 dist_coeffs: np.ndarray | None = None,
+                 margin: float = 1.2):
+        self.df = data
+        self.mesh = mesh
+        self.camera_intrinsics = camera_intrinsics
+        self.dist_coeffs = dist_coeffs
+        self.margin = margin
+        self.transform = T.Compose([
+            T.ToTensor()
+        ])
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        undist_image = Image.open(row["image_undistorted"]).convert("RGB")
+        undist_image = self.transform(undist_image)
+
+        pose = row["pose"]
+        roi = _get_2d_roi(
+            undist_image.shape,
+            self.mesh,
+            pose,
+            self.camera_intrinsics,
+            self.dist_coeffs,
+            self.margin
+        )
+
+        return undist_image, normalize_roi(
+            undist_image, torch.tensor(
+                [roi.cx, roi.cy, roi.w, roi.h],
+                dtype=undist_image.dtype,
+                device=undist_image.device
+            )
+        )
+
+
 class DataLoader:
     def __init__(self, path: Path):
         """
         Loads a Pose Estimation dataset from a directory.
         :param path: path to the raw dataset directory with the expected structure:
         The root directory should contain a single mesh file.
-        Each directory in the root directory should contain a single csv file that contains the pose data.
+        Each directory in the root directory should contain a single csv file that contains the pose data
+        and a single json file that contains the camera intrinsics.
         Each directory in the root directory should contain a directory named matching "*imgs" and "*imgs_undistorted"
         The images should be named in a way that starts with the index of the pose in the csv file.
         """

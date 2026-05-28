@@ -1,2 +1,2 @@
-from .roi_detector import ROIDetector
-from .roi import BBox, ROI
+from .roi_detector import ROIDetector, normalize_roi, denormalize_roi
+from .roi import BBox, ROI, bbox_to_roi, roi_to_bbox
