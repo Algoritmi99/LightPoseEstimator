@@ -14,7 +14,8 @@ class ROIDetectorTrainer:
                  batch_size: int = 32,
                  criterion: nn.Module = nn.SmoothL1Loss(),
                  optimizer_cls: type[torch.optim.optimizer.Optimizer] = torch.optim.Adam,
-                 optimizer_kwargs: dict | None = None
+                 optimizer_kwargs: dict | None = None,
+                 device: torch.device | None = None,
                  ):
 
         # Build DataLoaders
@@ -40,6 +41,9 @@ class ROIDetectorTrainer:
             else:
                 raise ValueError(f"Pass in optimizer_kwargs for {optimizer_cls}")
         self.optimizer = optimizer_cls(self.model.parameters(), **optimizer_kwargs)
+
+        # Store Device
+        self.device = device if device is not None else torch.device.cuda() if torch.cuda.is_available() else torch.device.cpu()
 
     def training_epoch(self):
         pass
