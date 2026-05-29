@@ -20,9 +20,9 @@ def parse_args():
     )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument(
-        "--freeze-backbone",
+        "--no-freeze-backbone",
         action="store_true",
-        help="Freeze the feature extractor and train only the ROI head.",
+        help="Train the full model including the feature extractor (backbone frozen by default).",
     )
     parser.add_argument(
         "--save-path",
@@ -52,14 +52,15 @@ def main():
     save_path = args.save_path.with_name(
         f"{args.save_path.stem}_{args.epochs}{args.save_path.suffix}"
     )
-    logging.info("Training for %d epochs (freeze_backbone=%s)", args.epochs, args.freeze_backbone)
+    freeze_backbone = not args.no_freeze_backbone
+    logging.info("Training for %d epochs (freeze_backbone=%s)", args.epochs, freeze_backbone)
     logging.info("Saving checkpoint to %s", save_path)
 
     trainer = ROIDetectorTrainer(roi_dataset, use_tensorboard=not args.no_tensorboard)
     trainer.train(
         args.epochs,
         save_path=str(save_path),
-        freeze_backbone=args.freeze_backbone,
+        freeze_backbone=freeze_backbone,
     )
 
 
