@@ -1,4 +1,5 @@
 from torch.utils.data import DataLoader, random_split
+from torch.utils.tensorboard import SummaryWriter
 import torch
 from torch import nn
 from tqdm import tqdm
@@ -17,6 +18,8 @@ class ROIDetectorTrainer:
                  optimizer_cls: type[torch.optim.optimizer.Optimizer] = torch.optim.Adam,
                  optimizer_kwargs: dict | None = None,
                  device: torch.device | None = None,
+                 use_tensorboard: bool = False,
+                 tensorboard_log_dir: str = "runs/roi_detector",
                  ):
 
         # Build DataLoaders
@@ -45,6 +48,9 @@ class ROIDetectorTrainer:
 
         # Store Device
         self.device = device if device is not None else torch.device.cuda() if torch.cuda.is_available() else torch.device.cpu()
+
+        self.use_tensorboard = use_tensorboard
+        self.tensorboard_log_dir = tensorboard_log_dir
 
     def training_epoch(self):
         self.model.train()
@@ -86,6 +92,18 @@ class ROIDetectorTrainer:
         elif hasattr(self.model, "unfreeze_backbone"):
             self.model.unfreeze_backbone()
 
-        for epoch in tqdm(range(epochs)):
-            train_loss = self.training_epoch()
-            val_loss = self.validation_epoch()
+        writer = (
+            SummaryWriter(log_dir=self.tensorboard_log_dir)
+            if self.use_tensorboard
+            else None
+        )
+        try:
+            for epoch in tqdm(range(epochs)):
+                train_loss = self.training_epoch()
+                val_loss = self.validation_epoch()
+                if writer is not None:
+                    writer.add_scalar("loss/train", train_loss, epoch)
+                    writer.add_scalar("loss/val", val_loss, epoch)
+        finally:
+            if writer is not None:
+                writer.close()
