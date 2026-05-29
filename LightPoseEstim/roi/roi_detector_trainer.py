@@ -81,6 +81,11 @@ class ROIDetectorTrainer:
         return total_loss / len(self.val_loader)
 
     def train(self, epochs: int, save_path: str | None = None, freeze_backbone: bool = False):
+        if freeze_backbone and hasattr(self.model, "freeze_backbone"):
+            self.model.freeze_backbone()
+        elif hasattr(self.model, "unfreeze_backbone"):
+            self.model.unfreeze_backbone()
+
         for epoch in tqdm(range(epochs)):
             train_loss = self.training_epoch()
             val_loss = self.validation_epoch()
