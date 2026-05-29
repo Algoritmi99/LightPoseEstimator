@@ -30,6 +30,11 @@ def parse_args():
         default=DEFAULT_SAVE_PATH,
         help="Checkpoint path; the epoch count is appended before the file extension.",
     )
+    parser.add_argument(
+        "--no-tensorboard",
+        action="store_true",
+        help="Disable TensorBoard logging (enabled by default).",
+    )
     return parser.parse_args()
 
 
@@ -50,7 +55,7 @@ def main():
     logging.info("Training for %d epochs (freeze_backbone=%s)", args.epochs, args.freeze_backbone)
     logging.info("Saving checkpoint to %s", save_path)
 
-    trainer = ROIDetectorTrainer(roi_dataset)
+    trainer = ROIDetectorTrainer(roi_dataset, use_tensorboard=not args.no_tensorboard)
     trainer.train(
         args.epochs,
         save_path=str(save_path),
