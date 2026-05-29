@@ -107,3 +107,6 @@ class ROIDetectorTrainer:
         finally:
             if writer is not None:
                 writer.close()
+
+        if save_path is not None:
+            torch.save(self.model.state_dict(), save_path)
