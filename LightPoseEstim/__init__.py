@@ -11,6 +11,7 @@ from .roi import (
     normalize_roi,
     roi_to_bbox,
     visualize_roi,
+    ROIDetectorTrainer
 )
 
 # Backwards compatibility alias
