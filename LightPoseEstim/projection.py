@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import trimesh
 
-from LightPoseEstim.pose import Pose
+from .pose import Pose
 
 
 def as_dist_coeffs(dist_coeffs: np.ndarray | None) -> np.ndarray:

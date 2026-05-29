@@ -1,7 +1,5 @@
 from .pose import Pose, Position, Quaternion
-from .dataloader import DataLoader, ImagePoseDataset, ImageROIDataset
 from .projection import project_mesh_vertices, project_points
-from .keypoint_selector import MeshKeypointSelector, CanonicalKeypoint
 from .roi import (
     BBox,
     ROI,
@@ -11,8 +9,10 @@ from .roi import (
     normalize_roi,
     roi_to_bbox,
     visualize_roi,
-    ROIDetectorTrainer
 )
+from .dataloader import DataLoader, ImagePoseDataset, ImageROIDataset
+from .roi.roi_detector_trainer import ROIDetectorTrainer
+from .keypoint_selector import MeshKeypointSelector, CanonicalKeypoint
 
 # Backwards compatibility alias
 project_mesh_points = project_mesh_vertices

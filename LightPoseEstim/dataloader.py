@@ -12,9 +12,9 @@ import trimesh
 from PIL import Image
 from torch.utils.data import Dataset
 
-from LightPoseEstim.pose import Pose
-from LightPoseEstim.projection import mesh_bbox_corners, project_points
-from LightPoseEstim.roi import BBox, ROI, bbox_to_roi, normalize_roi
+from .pose import Pose
+from .projection import mesh_bbox_corners, project_points
+from .roi import BBox, ROI, bbox_to_roi, normalize_roi
 
 logger = logging.getLogger(__name__)
 
