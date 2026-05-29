@@ -1,3 +1,6 @@
+import logging
+from pathlib import Path
+
 from torch.utils.data import DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
 import torch
@@ -108,7 +111,12 @@ class ROIDetectorTrainer:
 
         return total_loss / num_batches
 
-    def train(self, epochs: int, save_path: str | None = None, freeze_backbone: bool = False):
+    def train(
+        self,
+        epochs: int,
+        save_path: str | Path | None = None,
+        freeze_backbone: bool = False,
+    ):
         frozen = False
         unfrozen = False
         if freeze_backbone and hasattr(self.model, "freeze_backbone"):
@@ -123,17 +131,33 @@ class ROIDetectorTrainer:
             if self.use_tensorboard
             else None
         )
+        best_val_loss = float("inf")
+        best_epoch = -1
+        checkpoint_path = Path(save_path) if save_path is not None else None
+
         try:
             pbar = tqdm(range(epochs), unit="epoch")
             for epoch in pbar:
                 train_loss = self.training_epoch(pbar)
                 val_loss = self.validation_epoch(pbar)
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_epoch = epoch
+                    if checkpoint_path is not None:
+                        torch.save(self.model.state_dict(), checkpoint_path)
+                        logging.info(
+                            "New best val loss %.4f at epoch %d, saved to %s",
+                            val_loss,
+                            epoch,
+                            checkpoint_path,
+                        )
                 pbar.set_postfix(
                     device=str(self.device),
                     batch_size=self.batch_size,
                     phase="done",
                     train_loss=f"{train_loss:.4f}",
                     val_loss=f"{val_loss:.4f}",
+                    best_val=f"{best_val_loss:.4f}",
                 )
                 if writer is not None:
                     writer.add_scalar("loss/train", train_loss, epoch)
@@ -142,8 +166,15 @@ class ROIDetectorTrainer:
             if writer is not None:
                 writer.close()
 
-        if save_path is not None:
-            torch.save(self.model.state_dict(), save_path)
+        if checkpoint_path is not None and best_epoch >= 0:
+            self.model.load_state_dict(
+                torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+            )
+            logging.info(
+                "Restored best checkpoint from epoch %d (val loss %.4f)",
+                best_epoch,
+                best_val_loss,
+            )
 
         if frozen and hasattr(self.model, "unfreeze_backbone"):
             self.model.unfreeze_backbone()

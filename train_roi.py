@@ -28,7 +28,10 @@ def parse_args():
         "--save-path",
         type=Path,
         default=DEFAULT_SAVE_PATH,
-        help="Checkpoint path; the epoch count is appended before the file extension.",
+        help=(
+            "Checkpoint path for the best validation loss; "
+            "the epoch count is appended before the file extension."
+        ),
     )
     parser.add_argument(
         "--no-tensorboard",
