@@ -35,13 +35,23 @@ class ROIDetector(nn.Module):
             nn.Sigmoid(),
         )
 
+        self.__backbone_frozen = False
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        :param x: the input image
+        :return: normalized ROI tensor
+        """
         x = self.feature_extractor(x)
         x = self.pool(x)
         x = torch.flatten(x, 1)
         return self.head(x)
 
     def inference(self, x: torch.Tensor) -> list[ROI]:
+        """
+        :param x: the input image
+        :return: denormalized ROI object
+        """
         y = denormalize_roi(x, self.forward(x))
         return [
             ROI(
@@ -56,7 +66,13 @@ class ROIDetector(nn.Module):
     def freeze_backbone(self):
         for param in self.feature_extractor.parameters():
             param.requires_grad = False
+        self.__backbone_frozen = True
 
     def unfreeze_backbone(self):
         for param in self.feature_extractor.parameters():
             param.requires_grad = True
+        self.__backbone_frozen = False
+
+    @property
+    def backbone_frozen(self):
+        return self.__backbone_frozen

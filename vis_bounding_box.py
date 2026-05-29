@@ -10,7 +10,7 @@ DEFAULT_DATASET = Path(__file__).resolve().parent / "data" / "Astrobee"
 def parse_args():
     parser = argparse.ArgumentParser(description="Visualize projected mesh ROI on a dataset sample.")
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
-    parser.add_argument("--sample-idx", type=int, default=150)
+    parser.add_argument("--sample-idx", type=int, default=800)
     parser.add_argument("--margin", type=float, default=1.3)
     parser.add_argument("--mesh-scale", type=float, default=0.001)
     parser.add_argument(
