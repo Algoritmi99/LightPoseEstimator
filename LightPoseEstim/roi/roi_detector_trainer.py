@@ -1,6 +1,7 @@
 from torch.utils.data import DataLoader, random_split
 import torch
 from torch import nn
+from tqdm import tqdm
 
 from LightPoseEstim.dataloader import ImageROIDataset
 from .roi_detector import ROIDetector
@@ -46,10 +47,40 @@ class ROIDetectorTrainer:
         self.device = device if device is not None else torch.device.cuda() if torch.cuda.is_available() else torch.device.cpu()
 
     def training_epoch(self):
-        pass
+        self.model.train()
+        total_loss = 0.0
+        for images, rois in self.train_loader:
+            images = images.to(self.device)
+            rois = rois.to(self.device)
 
+            predictions = self.model(images)
+            loss = self.criterion(predictions, rois)
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            total_loss += loss.item()
+
+        return total_loss / len(self.train_loader)
+
+    @torch.no_grad()
     def validation_epoch(self):
-        pass
+        self.model.eval()
+        total_loss = 0.0
+
+        for images, rois in self.val_loader:
+            images = images.to(self.device)
+            rois = rois.to(self.device)
+
+            predictions = self.model(images)
+
+            loss = self.criterion(predictions, rois)
+
+            total_loss += loss.item()
+
+        return total_loss / len(self.val_loader)
 
     def train(self, epochs: int, save_path: str | None = None, freeze_backbone: bool = False):
-        pass
+        for epoch in tqdm(range(epochs)):
+            train_loss = self.training_epoch()
+            val_loss = self.validation_epoch()
