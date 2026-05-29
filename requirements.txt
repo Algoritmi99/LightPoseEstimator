@@ -9,3 +9,5 @@ torchvision~=0.27.0
 pillow~=12.2.0
 opencv-python~=4.13.0.92
 matplotlib~=3.10.9
+
+tqdm

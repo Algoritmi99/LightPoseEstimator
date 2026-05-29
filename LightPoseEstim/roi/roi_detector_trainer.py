@@ -87,10 +87,14 @@ class ROIDetectorTrainer:
         return total_loss / len(self.val_loader)
 
     def train(self, epochs: int, save_path: str | None = None, freeze_backbone: bool = False):
+        frozen = False
+        unfrozen = False
         if freeze_backbone and hasattr(self.model, "freeze_backbone"):
             self.model.freeze_backbone()
+            frozen = True
         elif hasattr(self.model, "unfreeze_backbone"):
             self.model.unfreeze_backbone()
+            unfrozen = True
 
         writer = (
             SummaryWriter(log_dir=self.tensorboard_log_dir)
@@ -98,9 +102,11 @@ class ROIDetectorTrainer:
             else None
         )
         try:
-            for epoch in tqdm(range(epochs)):
+            pbar = tqdm(range(epochs))
+            for epoch in pbar:
                 train_loss = self.training_epoch()
                 val_loss = self.validation_epoch()
+                pbar.set_postfix(train_loss=f"{train_loss:.4f}", val_loss=f"{val_loss:.4f}")
                 if writer is not None:
                     writer.add_scalar("loss/train", train_loss, epoch)
                     writer.add_scalar("loss/val", val_loss, epoch)
@@ -110,3 +116,11 @@ class ROIDetectorTrainer:
 
         if save_path is not None:
             torch.save(self.model.state_dict(), save_path)
+
+        if frozen and hasattr(self.model, "unfreeze_backbone"):
+            self.model.unfreeze_backbone()
+
+        if unfrozen and hasattr(self.model, "freeze_backbone"):
+            self.model.freeze_backbone()
+
+        return self.model
