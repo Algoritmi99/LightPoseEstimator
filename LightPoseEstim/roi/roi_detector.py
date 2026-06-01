@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import cast
 
 import torch
@@ -36,6 +37,16 @@ class ROIDetector(nn.Module):
         )
 
         self.__backbone_frozen = False
+
+    @classmethod
+    def load(cls, path: str | Path) -> "ROIDetector":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = cls()
+        model.load_state_dict(
+            torch.load(path, map_location=device, weights_only=True)
+        )
+        print(f"Loaded ROI detector from {path} to {device}")
+        return model.to(device).eval()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
