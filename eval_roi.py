@@ -15,7 +15,7 @@ def parse_args():
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("-k", type=int, default=200, help="Number of samples to evaluate.")
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
-    parser.add_argument("--start-idx", type=int, default=2100)
+    parser.add_argument("--start-idx", type=int, default=2300)
     parser.add_argument("--margin", type=float, default=1.3)
     parser.add_argument("--mesh-scale", type=float, default=0.001)
     parser.add_argument(
