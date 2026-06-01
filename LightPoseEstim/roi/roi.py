@@ -39,26 +39,8 @@ def bbox_to_roi(bbox: BBox) -> ROI:
     )
 
 
-def visualize_roi(
-    image,
-    roi,
-    projected_points=None,
-    normalized: bool = True,
-    title: str = "ROI Visualization",
-):
-    """Draw ROI box and optional projected 2D points on an image."""
-    if hasattr(image, "detach"):
-        image = image.detach().cpu().numpy()
-
-    if image.ndim == 3 and image.shape[0] in (1, 3):
-        image = np.transpose(image, (1, 2, 0))
-
-    image = np.ascontiguousarray(image)
-    if image.dtype != np.uint8:
-        image = (image * 255).clip(0, 255).astype(np.uint8)
-
-    h, w = image.shape[:2]
-
+def _draw_roi_box(vis, roi, normalized: bool, color: tuple[int, int, int]):
+    h, w = vis.shape[:2]
     if hasattr(roi, "detach"):
         roi = roi.detach().cpu().numpy()
 
@@ -73,10 +55,39 @@ def visualize_roi(
     y1 = int(cy - rh / 2)
     x2 = int(cx + rw / 2)
     y2 = int(cy + rh / 2)
+    cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+    cv2.circle(vis, (int(cx), int(cy)), 4, color, -1)
+
+
+def visualize_roi(
+    image,
+    roi,
+    projected_points=None,
+    normalized: bool = True,
+    title: str = "ROI Visualization",
+    reference_roi=None,
+    reference_normalized: bool | None = None,
+):
+    """Draw ROI box and optional projected 2D points on an image."""
+    if hasattr(image, "detach"):
+        image = image.detach().cpu().numpy()
+
+    if image.ndim == 3 and image.shape[0] in (1, 3):
+        image = np.transpose(image, (1, 2, 0))
+
+    image = np.ascontiguousarray(image)
+    if image.dtype != np.uint8:
+        image = (image * 255).clip(0, 255).astype(np.uint8)
+
+    h, w = image.shape[:2]
 
     vis = image.copy()
-    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-    cv2.circle(vis, (int(cx), int(cy)), 4, (255, 0, 0), -1)
+    if reference_roi is not None:
+        ref_normalized = (
+            normalized if reference_normalized is None else reference_normalized
+        )
+        _draw_roi_box(vis, reference_roi, ref_normalized, (255, 0, 0))
+    _draw_roi_box(vis, roi, normalized, (0, 255, 0))
 
     if projected_points is not None:
         if hasattr(projected_points, "detach"):
