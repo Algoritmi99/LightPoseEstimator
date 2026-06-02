@@ -5,7 +5,7 @@ from pathlib import Path
 from LightPoseEstim import DataLoader, ROIDetector, visualize_roi
 
 DEFAULT_DATASET = Path(__file__).resolve().parent / "data" / "Astrobee"
-DEFAULT_MODEL = Path("roi_detector_20.pth")
+DEFAULT_MODEL = Path("roi_detector_nf_20.pth")
 
 
 def parse_args():
