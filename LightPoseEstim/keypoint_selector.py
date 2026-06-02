@@ -8,6 +8,8 @@ from typing import Optional
 import numpy as np
 import trimesh
 
+from .projection import raycast_visible
+
 
 @dataclass
 class CanonicalKeypoint:
@@ -448,32 +450,12 @@ class MeshKeypointSelector:
         points: np.ndarray,
         allow_fallback: bool = True,
     ) -> Optional[np.ndarray]:
-        n = points.shape[0]
-        origins = np.repeat(camera_position[None, :], n, axis=0)
-        vec = points - origins
-        dist = np.linalg.norm(vec, axis=1)
-        dirs = self._safe_normalize(vec)
-
-        try:
-            loc, idx_ray, _ = mesh.ray.intersects_location(
-                ray_origins=origins,
-                ray_directions=dirs,
-                multiple_hits=False,
-            )
-        except BaseException:
-            # Fallback is used only for score robustness, not for strict external checks.
-            if allow_fallback:
-                return np.ones(n, dtype=bool)
-            return None
-
-        visible = np.zeros(n, dtype=bool)
-        if idx_ray.shape[0] == 0:
-            return visible
-
-        hit_dist = np.linalg.norm(loc - origins[idx_ray], axis=1)
-        tol = max(float(mesh.scale) * 1e-3, 1e-5)
-        visible[idx_ray] = np.abs(hit_dist - dist[idx_ray]) <= tol
-        return visible
+        return raycast_visible(
+            mesh,
+            camera_position,
+            points,
+            allow_fallback=allow_fallback,
+        )
 
     def _simulate_crop(
         self, points: np.ndarray, center: np.ndarray, view_dir: np.ndarray

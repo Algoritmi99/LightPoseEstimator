@@ -11,3 +11,4 @@ opencv-python~=4.13.0.92
 matplotlib~=3.10.9
 tqdm~=4.67.3
 tensorboard~=2.20.0
+rtree~=1.4.1

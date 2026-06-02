@@ -13,8 +13,9 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from .pose import Pose
-from .projection import mesh_bbox_corners, project_points
+from .projection import keypoint_visibility, mesh_bbox_corners, project_points
 from .roi import BBox, ROI, bbox_to_roi, normalize_roi
+from .keypoint_selector import CanonicalKeypoint
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,14 @@ def _get_2d_roi(
     return roi
 
 
+def _gaussian_heatmap(height: int, width: int, cx: float, cy: float, sigma: float = 3.0) -> torch.Tensor:
+    ys = np.arange(height, dtype=np.float32)
+    xs = np.arange(width, dtype=np.float32)
+    yy, xx = np.meshgrid(ys, xs, indexing="ij")
+    heatmap = np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2.0 * sigma ** 2))
+    return torch.from_numpy(heatmap)
+
+
 class ImagePoseDataset(Dataset):
     def __init__(self, data: pd.DataFrame):
         self.df = data
@@ -134,6 +143,59 @@ class ImageROIDataset(Dataset):
                 dtype=image.dtype,
                 device=image.device,
             ),
+        )
+
+class ImageKPHeatmapDataset(Dataset):
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        mesh: trimesh.Trimesh,
+        keypoints: list[CanonicalKeypoint],
+        margin: float = 1.4,
+    ):
+        self.df = data
+        self.mesh = mesh
+        self.margin = margin
+        self.keypoints = keypoints
+        self.transform = T.Compose([T.ToTensor()])
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        image = Image.open(row["image"]).convert("RGB")
+        image = self.transform(image)
+
+        height, width = image.shape[-2:]
+        pose = row["pose"]
+        points = np.stack([kp.position for kp in self.keypoints], axis=0).astype(np.float32)
+        image_points = project_points(
+            points,
+            pose,
+            row["camera_intrinsics"],
+            row["distortion_coeffs"],
+        )
+
+        visible = keypoint_visibility(self.mesh, points, pose)
+        in_bounds = (
+            (image_points[:, 0] >= 0) & (image_points[:, 0] < width) &
+            (image_points[:, 1] >= 0) & (image_points[:, 1] < height)
+        )
+        visible &= in_bounds
+
+        heatmaps = []
+        for i, _ in enumerate(self.keypoints):
+            if visible[i]:
+                x, y = image_points[i]
+                heatmaps.append(_gaussian_heatmap(height, width, float(x), float(y)))
+            else:
+                heatmaps.append(torch.zeros(height, width, dtype=image.dtype))
+
+        return (
+            image,
+            torch.stack(heatmaps),
+            torch.from_numpy(visible.astype(np.float32)),
         )
 
 
@@ -245,3 +307,6 @@ class DataLoader:
 
     def get_roi_dataset(self, margin: float = 1.4):
         return ImageROIDataset(self.data, self.mesh, margin=margin)
+
+    def get_kp_heatmap_dataset(self, keypoints: list[CanonicalKeypoint], margin: float = 1.4):
+        return ImageKPHeatmapDataset(self.data, self.mesh, keypoints, margin=margin)
