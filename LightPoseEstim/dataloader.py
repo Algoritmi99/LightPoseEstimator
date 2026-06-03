@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as T
 import trimesh
 from PIL import Image
@@ -14,7 +15,7 @@ from torch.utils.data import Dataset
 
 from .pose import Pose
 from .projection import keypoint_visibility, mesh_bbox_corners, project_points
-from .roi import BBox, ROI, bbox_to_roi, normalize_roi
+from .roi import BBox, ROI, bbox_to_roi, normalize_roi, roi_to_bbox
 from .keypoint_selector import CanonicalKeypoint
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,35 @@ def _gaussian_heatmap(height: int, width: int, cx: float, cy: float, sigma: floa
     return torch.from_numpy(heatmap)
 
 
+def _crop_and_resize(
+    image: torch.Tensor,
+    heatmaps: torch.Tensor,
+    roi: ROI,
+    crop_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _, height, width = image.shape
+    bbox = roi_to_bbox(roi)
+    x1 = int(max(0, np.floor(bbox.x1)))
+    y1 = int(max(0, np.floor(bbox.y1)))
+    x2 = int(min(width, np.ceil(bbox.x2)))
+    y2 = int(min(height, np.ceil(bbox.y2)))
+    if x2 <= x1:
+        x2 = min(width, x1 + 1)
+    if y2 <= y1:
+        y2 = min(height, y1 + 1)
+
+    image = image[:, y1:y2, x1:x2]
+    heatmaps = heatmaps[:, y1:y2, x1:x2]
+    size = (crop_size, crop_size)
+    image = F.interpolate(
+        image.unsqueeze(0), size=size, mode="bilinear", align_corners=False
+    ).squeeze(0)
+    heatmaps = F.interpolate(
+        heatmaps.unsqueeze(0), size=size, mode="bilinear", align_corners=False
+    ).squeeze(0)
+    return image, heatmaps
+
+
 class ImagePoseDataset(Dataset):
     def __init__(self, data: pd.DataFrame):
         self.df = data
@@ -145,6 +175,7 @@ class ImageROIDataset(Dataset):
             ),
         )
 
+
 class ImageKPHeatmapDataset(Dataset):
     def __init__(
         self,
@@ -159,14 +190,11 @@ class ImageKPHeatmapDataset(Dataset):
         self.keypoints = keypoints
         self.transform = T.Compose([T.ToTensor()])
 
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
+    def _load_image(self, row) -> torch.Tensor:
         image = Image.open(row["image"]).convert("RGB")
-        image = self.transform(image)
+        return self.transform(image)
 
+    def _build_kp_heatmaps(self, row, image: torch.Tensor) -> torch.Tensor:
         height, width = image.shape[-2:]
         pose = row["pose"]
         points = np.stack([kp.position for kp in self.keypoints], axis=0).astype(np.float32)
@@ -192,11 +220,45 @@ class ImageKPHeatmapDataset(Dataset):
             else:
                 heatmaps.append(torch.zeros(height, width, dtype=image.dtype))
 
-        return (
-            image,
-            torch.stack(heatmaps),
-            torch.from_numpy(visible.astype(np.float32)),
+        return torch.stack(heatmaps)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        image = self._load_image(row)
+        heatmaps = self._build_kp_heatmaps(row, image)
+        return image, heatmaps
+
+
+class ImageKPHeatmapROIDataset(ImageKPHeatmapDataset):
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        mesh: trimesh.Trimesh,
+        keypoints: list[CanonicalKeypoint],
+        crop_size: int = 256,
+        margin: float = 1.4,
+    ):
+        super().__init__(data, mesh, keypoints, margin=margin)
+        self.crop_size = crop_size
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        image = self._load_image(row)
+        heatmaps = self._build_kp_heatmaps(row, image)
+
+        roi = _get_2d_roi(
+            image.shape,
+            self.mesh,
+            row["pose"],
+            row["camera_intrinsics"],
+            row["distortion_coeffs"],
+            self.margin,
         )
+        image, heatmaps = _crop_and_resize(image, heatmaps, roi, self.crop_size)
+        return image, heatmaps
 
 
 class DataLoader:
@@ -310,3 +372,17 @@ class DataLoader:
 
     def get_kp_heatmap_dataset(self, keypoints: list[CanonicalKeypoint], margin: float = 1.4):
         return ImageKPHeatmapDataset(self.data, self.mesh, keypoints, margin=margin)
+
+    def get_kp_heatmap_roi_dataset(
+        self,
+        keypoints: list[CanonicalKeypoint],
+        crop_size: int = 256,
+        margin: float = 1.4,
+    ):
+        return ImageKPHeatmapROIDataset(
+            self.data,
+            self.mesh,
+            keypoints,
+            crop_size=crop_size,
+            margin=margin,
+        )

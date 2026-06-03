@@ -80,3 +80,8 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Model checkpoints and training artifacts
+*.pth
+runs/
+keypoint_heatmap*/

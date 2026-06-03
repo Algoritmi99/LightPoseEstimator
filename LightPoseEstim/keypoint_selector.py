@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -18,6 +19,141 @@ class CanonicalKeypoint:
     semantic_label: Optional[str] = None
     visibility_prior: Optional[float] = None
     stability_prior: Optional[float] = None
+
+
+KEYPOINTS_SUBDIR = "keypoints"
+KEYPOINTS_FILENAME = "keypoints.npz"
+NET_SUBDIR = "net"
+
+
+@dataclass(frozen=True)
+class KeypointRunPaths:
+    run_dir: Path
+    net_checkpoint: Path
+    keypoints: Path
+
+
+def resolve_keypoint_run_paths(save_path: str | Path, epochs: int) -> KeypointRunPaths:
+    """
+    Layout under the save-path base::
+
+        {stem}_{epochs}/
+          net/{original_checkpoint_name}
+          keypoints/keypoints.npz
+    """
+    save_path = Path(save_path)
+    run_dir = save_path.parent / f"{save_path.stem}_{epochs}"
+    net_checkpoint = run_dir / NET_SUBDIR / save_path.name
+    keypoints = run_dir / KEYPOINTS_SUBDIR / KEYPOINTS_FILENAME
+    return KeypointRunPaths(run_dir, net_checkpoint, keypoints)
+
+
+def paths_from_keypoint_run_dir(run_dir: str | Path) -> KeypointRunPaths:
+    run_dir = Path(run_dir)
+    net_dir = run_dir / NET_SUBDIR
+    if not net_dir.is_dir():
+        raise FileNotFoundError(f"Keypoint net directory not found: {net_dir}")
+    checkpoints = sorted(net_dir.glob("*.pth"))
+    if len(checkpoints) != 1:
+        raise ValueError(
+            f"Expected exactly one .pth in {net_dir}, found {len(checkpoints)}"
+        )
+    keypoints = run_dir / KEYPOINTS_SUBDIR / KEYPOINTS_FILENAME
+    if not keypoints.is_file():
+        raise FileNotFoundError(f"Keypoints file not found: {keypoints}")
+    return KeypointRunPaths(run_dir, checkpoints[0], keypoints)
+
+
+def paths_from_keypoint_model(model: str | Path) -> KeypointRunPaths:
+    """
+    Resolve a prior training run from a run directory or a checkpoint under ``net/``.
+    """
+    model = Path(model)
+    if model.is_dir():
+        return paths_from_keypoint_run_dir(model)
+    if model.is_file() and model.parent.name == NET_SUBDIR:
+        return paths_from_keypoint_run_dir(model.parent.parent)
+    raise ValueError(
+        f"Cannot resolve keypoint run from {model}. "
+        "Pass a run directory (e.g. keypoint_heatmap_20) or a checkpoint under .../net/."
+    )
+
+
+def save_canonical_keypoints(
+    path: str | Path,
+    keypoints: list[CanonicalKeypoint],
+) -> Path:
+    path = Path(path)
+    positions = np.stack(
+        [np.asarray(kp.position, dtype=np.float32).reshape(3) for kp in keypoints],
+        axis=0,
+    )
+    keypoint_ids = np.array([kp.keypoint_id for kp in keypoints], dtype=np.int32)
+    semantic_labels = np.array(
+        [kp.semantic_label or "" for kp in keypoints],
+        dtype=object,
+    )
+    visibility_prior = np.array(
+        [
+            np.nan if kp.visibility_prior is None else kp.visibility_prior
+            for kp in keypoints
+        ],
+        dtype=np.float32,
+    )
+    stability_prior = np.array(
+        [
+            np.nan if kp.stability_prior is None else kp.stability_prior
+            for kp in keypoints
+        ],
+        dtype=np.float32,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        path,
+        positions=positions,
+        keypoint_ids=keypoint_ids,
+        semantic_labels=semantic_labels,
+        visibility_prior=visibility_prior,
+        stability_prior=stability_prior,
+    )
+    logging.info("Saved %d canonical keypoints to %s", len(keypoints), path)
+    return path
+
+
+def load_canonical_keypoints(path: str | Path) -> list[CanonicalKeypoint]:
+    with np.load(Path(path), allow_pickle=True) as data:
+        positions = data["positions"]
+        keypoint_ids = data["keypoint_ids"]
+        semantic_labels = data["semantic_labels"] if "semantic_labels" in data else None
+        visibility_prior = (
+            data["visibility_prior"] if "visibility_prior" in data else None
+        )
+        stability_prior = (
+            data["stability_prior"] if "stability_prior" in data else None
+        )
+
+    keypoints: list[CanonicalKeypoint] = []
+    for i in range(len(positions)):
+        label = None
+        if semantic_labels is not None:
+            raw = semantic_labels[i]
+            label = str(raw) if raw else None
+        vis = None
+        if visibility_prior is not None and not np.isnan(visibility_prior[i]):
+            vis = float(visibility_prior[i])
+        stab = None
+        if stability_prior is not None and not np.isnan(stability_prior[i]):
+            stab = float(stability_prior[i])
+        keypoints.append(
+            CanonicalKeypoint(
+                keypoint_id=int(keypoint_ids[i]),
+                position=positions[i].copy(),
+                semantic_label=label,
+                visibility_prior=vis,
+                stability_prior=stab,
+            )
+        )
+    return keypoints
 
 
 @dataclass

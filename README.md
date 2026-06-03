@@ -24,6 +24,50 @@ Options:
 - `--no-recenter-mesh` — skip translating mesh bbox center to origin
 - `--margin` — ROI padding factor around projected bbox
 
+## Train ROI detector
+
+Stage 0 (from scratch, backbone frozen by default):
+
+```bash
+python train_roi_0.py --dataset data/Astrobee --epochs 20
+```
+
+Stage 1 (fine-tune from a prior checkpoint):
+
+```bash
+python train_roi_1.py --model roi_detector_20.pth --epochs 20
+```
+
+Checkpoints are saved as `{stem}_{epochs}.pth` (e.g. `roi_detector_20.pth`).
+
+Evaluate a trained ROI model:
+
+```bash
+python eval_roi.py --model roi_detector_nf_20.pth
+```
+
+## Train keypoint heatmap net
+
+Stage 0 selects canonical mesh keypoints, then trains the heatmap network:
+
+```bash
+python train_kp_0.py --dataset data/Astrobee --epochs 20 --keypoint-count 24
+```
+
+Stage 1 fine-tunes from a prior run directory or checkpoint:
+
+```bash
+python train_kp_1.py --model keypoint_heatmap_20 --epochs 20
+```
+
+Run artifacts are written under `{save_stem}_{epochs}/`:
+
+```
+keypoint_heatmap_20/
+  net/keypoint_heatmap.pth
+  keypoints/keypoints.npz
+```
+
 ## Dataset layout
 
 ```
