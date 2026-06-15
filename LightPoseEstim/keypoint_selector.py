@@ -9,7 +9,7 @@ from typing import Optional
 import numpy as np
 import trimesh
 
-from .projection import raycast_visible
+from .projection import create_ray_intersector, ray_backend_available, raycast_visible
 
 
 @dataclass
@@ -216,17 +216,24 @@ class MeshKeypointSelector:
         if mesh.vertices.shape[0] < 4 or mesh.faces.shape[0] < 4:
             raise ValueError("mesh is too small to select robust keypoints")
 
-        mesh = mesh.copy()
-        mesh.remove_infinite_values()
-        mesh.remove_unreferenced_vertices()
-
         k_final = int(keypoint_count or self.final_keypoint_count)
         if k_final <= 0:
             raise ValueError("keypoint_count must be > 0")
 
+        if not ray_backend_available():
+            logging.warning(
+                "rtree is not available; keypoint visibility scoring will use heuristics."
+            )
+
+        ray_intersector = create_ray_intersector(mesh)
+
         candidates = self._sample_candidates(mesh, self.candidate_count)
-        visibility_ratio, stability_ratio = self._simulate_coverage(mesh, candidates)
-        external_surface_ratio = self._estimate_external_surface_visibility(mesh, candidates)
+        visibility_ratio, stability_ratio = self._simulate_coverage(
+            mesh, candidates, ray_intersector
+        )
+        external_surface_ratio = self._estimate_external_surface_visibility(
+            mesh, candidates, ray_intersector
+        )
         distinctiveness = self._compute_distinctiveness(candidates)
         geometric_usefulness = self._compute_geometric_usefulness(candidates, mesh)
 
@@ -277,6 +284,7 @@ class MeshKeypointSelector:
                     stability_prior=float(scores.stability[idx]),
                 )
             )
+        del ray_intersector
         return output
 
     def show_keypoints(
@@ -383,13 +391,17 @@ class MeshKeypointSelector:
             trimesh_logger.setLevel(old_level)
 
     def _simulate_coverage(
-        self, mesh: trimesh.Trimesh, candidates: CandidatePool
+        self,
+        mesh: trimesh.Trimesh,
+        candidates: CandidatePool,
+        ray_intersector: trimesh.ray.ray_triangle.RayMeshIntersector | None,
     ) -> tuple[np.ndarray, np.ndarray]:
         points = candidates.points
         normals = candidates.normals
         n = points.shape[0]
 
-        directions = self._fibonacci_sphere(self.num_viewpoints)
+        num_views = self._effective_num_viewpoints(mesh)
+        directions = self._fibonacci_sphere(num_views)
         centroid = mesh.centroid
         mesh_scale = max(float(mesh.scale), 1e-6)
         radius = 2.5 * mesh_scale
@@ -407,17 +419,28 @@ class MeshKeypointSelector:
             to_cam_dir = self._safe_normalize(to_cam)
             facing = np.einsum("ij,ij->i", normals, to_cam_dir) > 0.02
 
-            if not np.any(facing):
+            facing_idx = np.flatnonzero(facing)
+            if facing_idx.shape[0] == 0:
                 continue
 
-            ray_visible = self._raycast_visible(mesh, cam_pos, points)
-            visible = facing & ray_visible
+            ray_visible = self._raycast_visible(
+                mesh,
+                cam_pos,
+                points[facing_idx],
+                allow_fallback=True,
+                intersector=ray_intersector,
+            )
+            if ray_visible is None:
+                ray_visible = np.ones(facing_idx.shape[0], dtype=bool)
+
+            visible = np.zeros(n, dtype=bool)
+            visible[facing_idx] = ray_visible
 
             # Simulated random crops/truncations in projected coordinates.
             in_crop = self._simulate_crop(points, centroid, view_dir)
             # Simulated partial occluder (sphere between camera and object center).
             occluded = self._simulate_occluder(cam_pos, centroid, points, mesh_scale)
-            visible = visible & in_crop & (~occluded)
+            visible &= in_crop & (~occluded)
 
             visible_count += visible.astype(np.float64)
             valid_views += 1
@@ -497,7 +520,10 @@ class MeshKeypointSelector:
         return vis_ok & ext_ok & stab_ok & total_ok
 
     def _estimate_external_surface_visibility(
-        self, mesh: trimesh.Trimesh, candidates: CandidatePool
+        self,
+        mesh: trimesh.Trimesh,
+        candidates: CandidatePool,
+        ray_intersector: trimesh.ray.ray_triangle.RayMeshIntersector | None,
     ) -> np.ndarray:
         """
         Estimate how likely each candidate belongs to externally visible surface.
@@ -514,7 +540,7 @@ class MeshKeypointSelector:
         outward_dir = self._safe_normalize(points - centroid[None, :])
         outward_score = (np.einsum("ij,ij->i", normals, outward_dir) > 0.0).astype(np.float64)
 
-        probe_views = max(24, min(96, self.num_viewpoints // 2))
+        probe_views = max(24, min(96, self._effective_num_viewpoints(mesh) // 2))
         directions = self._fibonacci_sphere(probe_views)
         radius = 3.0 * mesh_scale
 
@@ -527,16 +553,24 @@ class MeshKeypointSelector:
             to_cam = cam_pos[None, :] - points
             to_cam_dir = self._safe_normalize(to_cam)
             facing = np.einsum("ij,ij->i", normals, to_cam_dir) > 0.05
-            if not np.any(facing):
+            facing_idx = np.flatnonzero(facing)
+            if facing_idx.shape[0] == 0:
                 continue
 
-            ray_visible = self._raycast_visible(mesh, cam_pos, points, allow_fallback=False)
+            ray_visible = self._raycast_visible(
+                mesh,
+                cam_pos,
+                points[facing_idx],
+                allow_fallback=False,
+                intersector=ray_intersector,
+            )
             if ray_visible is None:
                 # Ray backend unavailable in this environment.
                 continue
 
             ray_backend_ok = True
-            visible = facing & ray_visible
+            visible = np.zeros(n, dtype=bool)
+            visible[facing_idx] = ray_visible
             visible_count += visible.astype(np.float64)
             valid_views += 1
 
@@ -585,12 +619,14 @@ class MeshKeypointSelector:
         camera_position: np.ndarray,
         points: np.ndarray,
         allow_fallback: bool = True,
+        intersector: trimesh.ray.ray_triangle.RayMeshIntersector | None = None,
     ) -> Optional[np.ndarray]:
         return raycast_visible(
             mesh,
             camera_position,
             points,
             allow_fallback=allow_fallback,
+            intersector=intersector,
         )
 
     def _simulate_crop(
@@ -650,11 +686,38 @@ class MeshKeypointSelector:
 
         return d <= occ_radius
 
+    def _effective_num_viewpoints(self, mesh: trimesh.Trimesh) -> int:
+        n_faces = len(mesh.faces)
+        if n_faces > 500_000:
+            return min(self.num_viewpoints, 96)
+        if n_faces > 100_000:
+            return min(self.num_viewpoints, 160)
+        return self.num_viewpoints
+
     @staticmethod
     def _k_nearest_indices(points: np.ndarray, k: int) -> np.ndarray:
-        dist = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=2)
-        np.fill_diagonal(dist, np.inf)
-        return np.argpartition(dist, kth=min(k, dist.shape[1] - 1), axis=1)[:, :k]
+        n = points.shape[0]
+        k = min(k, n - 1)
+        if k <= 0:
+            return np.zeros((n, 0), dtype=np.int64)
+
+        nearest = np.full((n, k), np.inf, dtype=np.float64)
+        indices = np.zeros((n, k), dtype=np.int64)
+        chunk = 256
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            dist = np.linalg.norm(
+                points[start:end, None, :] - points[None, :, :],
+                axis=2,
+            )
+            row_ids = np.arange(end - start)
+            dist[row_ids, start + row_ids] = np.inf
+            part = np.argpartition(dist, kth=k, axis=1)[:, :k]
+            part_dist = np.take_along_axis(dist, part, axis=1)
+            order = np.argsort(part_dist, axis=1)
+            nearest[start:end] = np.take_along_axis(part_dist, order, axis=1)
+            indices[start:end] = np.take_along_axis(part, order, axis=1)
+        return indices
 
     @staticmethod
     def _local_curvature(points: np.ndarray, neighbor_indices: np.ndarray) -> np.ndarray:
