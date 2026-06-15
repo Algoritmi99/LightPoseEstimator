@@ -13,6 +13,7 @@ _MAX_BRUTEFORCE_FACES = 50_000
 _MAX_RAYCAST_FACES = 50_000
 _RAY_BATCH_SIZE = 128
 _RAY_FALLBACK_WARNED = False
+_RAY_INTERSECTOR_CACHE: dict[int, trimesh.ray.ray_triangle.RayMeshIntersector | None] = {}
 
 
 def ray_backend_available() -> bool:
@@ -57,8 +58,14 @@ def coarsen_mesh_for_raycast(
 def create_ray_intersector(
     mesh: trimesh.Trimesh,
 ) -> trimesh.ray.ray_triangle.RayMeshIntersector | None:
+    cache_key = id(mesh)
+    if cache_key in _RAY_INTERSECTOR_CACHE:
+        return _RAY_INTERSECTOR_CACHE[cache_key]
+
     if not ray_backend_available():
+        _RAY_INTERSECTOR_CACHE[cache_key] = None
         return None
+
     n_faces = len(mesh.faces)
     ray_mesh = coarsen_mesh_for_raycast(mesh)
     if n_faces > _MAX_RAYCAST_FACES:
@@ -67,7 +74,9 @@ def create_ray_intersector(
             n_faces,
             len(ray_mesh.faces),
         )
-    return trimesh.ray.ray_triangle.RayMeshIntersector(ray_mesh)
+    intersector = trimesh.ray.ray_triangle.RayMeshIntersector(ray_mesh)
+    _RAY_INTERSECTOR_CACHE[cache_key] = intersector
+    return intersector
 
 
 def _raycast_mesh(
