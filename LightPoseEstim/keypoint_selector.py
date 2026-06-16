@@ -45,6 +45,8 @@ def resolve_keypoint_run_paths(save_path: str | Path, epochs: int) -> KeypointRu
     run_dir = save_path.parent / f"{save_path.stem}_{epochs}"
     net_checkpoint = run_dir / NET_SUBDIR / save_path.name
     keypoints = run_dir / KEYPOINTS_SUBDIR / KEYPOINTS_FILENAME
+    net_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    keypoints.parent.mkdir(parents=True, exist_ok=True)
     return KeypointRunPaths(run_dir, net_checkpoint, keypoints)
 
 
