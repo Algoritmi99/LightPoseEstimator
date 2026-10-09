@@ -44,10 +44,10 @@ def _find_distorted_image_dir(directory: Path) -> Path:
     return candidates[0]
 
 
-def _find_undistorted_image_dir(directory: Path) -> Path:
+def _find_undistorted_image_dir(directory: Path) -> Path | None:
     candidates = sorted(directory.glob("*imgs_undistorted"))
     if not candidates:
-        raise StopIteration(f"No undistorted image directory in {directory}")
+        return None
     return candidates[0]
 
 
@@ -268,7 +268,8 @@ class DataLoader:
 
         Expected layout:
         - One mesh file at the dataset root.
-        - Per recording: one CSV (poses), one JSON (K, D), ``*imgs`` and ``*_undistorted`` folders.
+        - Per recording: one CSV (poses), one JSON (K, D), and a ``*imgs`` folder.
+          ``*imgs_undistorted`` is optional. When it is absent, ``image_undistorted`` is omitted.
         """
         self.path = path
         self.mesh_scale = mesh_scale
@@ -298,10 +299,15 @@ class DataLoader:
                 continue
             try:
                 imgs = _find_distorted_image_dir(directory)
-                imgs_undistorted = _find_undistorted_image_dir(directory)
             except StopIteration as exc:
                 logger.warning("Skipping %s: %s", directory.name, exc)
                 continue
+            imgs_undistorted = _find_undistorted_image_dir(directory)
+            if imgs_undistorted is None:
+                logger.info(
+                    "No undistorted images in %s; skipping image_undistorted.",
+                    directory.name,
+                )
 
             json_files = list(directory.glob("*.json"))
             assert len(json_files) == 1, (
@@ -326,10 +332,6 @@ class DataLoader:
                 )
 
                 img_files = _find_image(imgs, row["Timestamp"])
-                img_undistorted_files = _find_image(
-                    imgs_undistorted, row["Timestamp"], "_undistorted"
-                )
-
                 if len(img_files) != 1:
                     logger.warning(
                         "Skipping row in %s at timestamp %s: found %d distorted image(s).",
@@ -338,23 +340,27 @@ class DataLoader:
                         len(img_files),
                     )
                     continue
-                if len(img_undistorted_files) != 1:
-                    logger.warning(
-                        "Skipping row in %s at timestamp %s: found %d undistorted image(s).",
-                        directory.name,
-                        row["Timestamp"],
-                        len(img_undistorted_files),
-                    )
-                    continue
 
-                rows.append({
+                sample = {
                     "id": len(rows),
                     "pose": pose,
                     "camera_intrinsics": camera_intrinsics,
                     "distortion_coeffs": distortion_coeffs,
                     "image": img_files[0],
-                    "image_undistorted": img_undistorted_files[0],
-                })
+                }
+                if imgs_undistorted is not None:
+                    img_undistorted_files = _find_image(
+                        imgs_undistorted, row["Timestamp"], "_undistorted"
+                    )
+                    if len(img_undistorted_files) == 1:
+                        sample["image_undistorted"] = img_undistorted_files[0]
+                    else:
+                        logger.warning(
+                            "No undistorted image in %s at timestamp %s.",
+                            directory.name,
+                            row["Timestamp"],
+                        )
+                rows.append(sample)
 
         logger.info(
             "Loaded %d samples from %d CSV rows in %s.",
@@ -365,6 +371,8 @@ class DataLoader:
         return pd.DataFrame(rows)
 
     def get_pose_dataset(self):
+        if "image_undistorted" not in self.data.columns:
+            raise ValueError("Dataset has no undistorted images.")
         return ImagePoseDataset(self.data)
 
     def get_roi_dataset(self, margin: float = 1.4):

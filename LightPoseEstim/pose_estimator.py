@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,9 @@ from .pose import Pose
 from .projection import as_dist_coeffs
 from .roi import ROI, roi_to_bbox
 from .roi.roi_detector import ROIDetector
+
+ROI_CHECKPOINT_RELATIVE = Path("roi") / "roi_detector.pth"
+RUN_CONFIG_RELATIVE = Path("config.json")
 
 
 @dataclass
@@ -101,6 +105,28 @@ class PoseEstimator:
             camera_intrinsics=camera_intrinsics,
             distortion_coeffs=distortion_coeffs,
             crop_size=crop_size,
+            peak_threshold=peak_threshold,
+            device=device,
+        )
+
+    @classmethod
+    def load_run(
+        cls,
+        run_dir: str | Path,
+        camera_intrinsics: np.ndarray,
+        distortion_coeffs: np.ndarray | None = None,
+        peak_threshold: float = 0.1,
+        device: torch.device | None = None,
+    ) -> "PoseEstimator":
+        run_dir = Path(run_dir)
+        with (run_dir / RUN_CONFIG_RELATIVE).open() as handle:
+            config = json.load(handle)
+        return cls.load(
+            roi_detector_path=run_dir / ROI_CHECKPOINT_RELATIVE,
+            camera_intrinsics=camera_intrinsics,
+            keypoint_run_dir=run_dir,
+            distortion_coeffs=distortion_coeffs,
+            crop_size=int(config["crop_size"]),
             peak_threshold=peak_threshold,
             device=device,
         )
