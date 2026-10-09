@@ -1,2 +1,2 @@
-from .keypoint_heatmap import KeypointHeatmapNet, heatmap_peaks
+from .keypoint_heatmap import DEFAULT_PEAK_THRESHOLD, HeatmapFocalLoss, KeypointHeatmapNet, heatmap_peaks
 from .keypoint_heatmap_trainer import KeypointHeatmapTrainer

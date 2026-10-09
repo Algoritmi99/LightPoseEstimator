@@ -1,110 +1,67 @@
-import importlib.util
+import functools
 import logging
 
 import cv2
 import numpy as np
+import torch
 import trimesh
 
 from .pose import Pose
 
 logger = logging.getLogger(__name__)
 
-_MAX_BRUTEFORCE_FACES = 50_000
-_MAX_RAYCAST_FACES = 50_000
-_RAY_BATCH_SIZE = 128
-_RAY_FALLBACK_WARNED = False
-_RAY_INTERSECTOR_CACHE: dict[int, trimesh.ray.ray_triangle.RayMeshIntersector | None] = {}
-
-
-def ray_backend_available() -> bool:
-    return importlib.util.find_spec("rtree") is not None
-
-
-def _can_use_bruteforce_raycast(mesh: trimesh.Trimesh) -> bool:
-    return len(mesh.faces) <= _MAX_BRUTEFORCE_FACES
-
-
-def coarsen_mesh_for_raycast(
-    mesh: trimesh.Trimesh,
-    max_faces: int = _MAX_RAYCAST_FACES,
-) -> trimesh.Trimesh:
-    """Build a spatially uniform face subset for memory-bounded ray tracing."""
-    n_faces = len(mesh.faces)
-    if n_faces <= max_faces:
-        return mesh
-
-    centroids = mesh.triangles_center
-    bounds = mesh.bounds
-    extent = bounds[1] - bounds[0]
-    volume = float(np.prod(np.maximum(extent, mesh.scale * 1e-6)))
-    cell_size = max((volume / max_faces) ** (1.0 / 3.0), float(mesh.scale) * 1e-4)
-    bins = np.floor((centroids - bounds[0]) / cell_size).astype(np.int64)
-    keys = bins[:, 0] * 73856093 + bins[:, 1] * 19349663 + bins[:, 2] * 83492791
-    _, pick = np.unique(keys, return_index=True)
-    coarse = trimesh.Trimesh(
-        vertices=mesh.vertices,
-        faces=mesh.faces[pick],
-        process=False,
-    )
-    coarse.remove_unreferenced_vertices()
-    logger.info(
-        "Coarsened mesh for ray tracing from %d to %d faces.",
-        n_faces,
-        len(coarse.faces),
-    )
-    return coarse
-
-
-def create_ray_intersector(
-    mesh: trimesh.Trimesh,
-) -> trimesh.ray.ray_triangle.RayMeshIntersector | None:
-    cache_key = id(mesh)
-    if cache_key in _RAY_INTERSECTOR_CACHE:
-        return _RAY_INTERSECTOR_CACHE[cache_key]
-
-    if not ray_backend_available():
-        _RAY_INTERSECTOR_CACHE[cache_key] = None
-        return None
-
-    n_faces = len(mesh.faces)
-    ray_mesh = coarsen_mesh_for_raycast(mesh)
-    if n_faces > _MAX_RAYCAST_FACES:
-        logger.info(
-            "Large mesh (%d faces); ray tracing uses %d coarsened faces.",
-            n_faces,
-            len(ray_mesh.faces),
-        )
-    intersector = trimesh.ray.ray_triangle.RayMeshIntersector(ray_mesh)
-    _RAY_INTERSECTOR_CACHE[cache_key] = intersector
-    return intersector
-
-
-def _raycast_mesh(
-    mesh: trimesh.Trimesh,
-    intersector: trimesh.ray.ray_triangle.RayMeshIntersector | None,
-) -> trimesh.Trimesh:
-    if intersector is not None:
-        return intersector.mesh
-    return mesh
-
-
-def _warn_ray_fallback(reason: str, mesh: trimesh.Trimesh) -> None:
-    global _RAY_FALLBACK_WARNED
-    if _RAY_FALLBACK_WARNED:
-        return
-    _RAY_FALLBACK_WARNED = True
-    logger.warning(
-        "Mesh ray tracing unavailable (%s). Mesh has %d faces; "
-        "skipping bruteforce raycast and using heuristic fallback where allowed.",
-        reason,
-        len(mesh.faces),
-    )
+_OCCLUSION_CHUNK_ELEMENTS = 1 << 24  # rays x triangles tested per step
+_FOLD_SEARCH_MAX_RADIUS = 10.0  # ~84 degrees off-axis
+_FOLD_SEARCH_STEPS = 100_001
 
 
 def as_dist_coeffs(dist_coeffs: np.ndarray | None) -> np.ndarray:
     if dist_coeffs is None:
         return np.zeros((5, 1), dtype=np.float32)
     return np.asarray(dist_coeffs, dtype=np.float32).reshape(-1, 1)
+
+
+@functools.lru_cache(maxsize=32)
+def _max_valid_radius(coeffs: tuple[float, ...]) -> float:
+    k = np.zeros(8)
+    k[: min(len(coeffs), 8)] = coeffs[:8]
+    k1, k2, _, _, k3, k4, k5, k6 = k
+    r = np.linspace(0.0, _FOLD_SEARCH_MAX_RADIUS, _FOLD_SEARCH_STEPS)
+    r2 = r * r
+    distorted = r * (1 + k1 * r2 + k2 * r2**2 + k3 * r2**3) / (1 + k4 * r2 + k5 * r2**2 + k6 * r2**3)
+    turning = np.flatnonzero(np.diff(distorted) <= 0)
+    return float(r[turning[0]]) if turning.size else np.inf
+
+
+def max_valid_radius(dist_coeffs: np.ndarray | None) -> float:
+    """
+    Largest undistorted radius sqrt(x^2 + y^2) / z at which the radial distortion model
+    is still monotonic. Past it, cv2.projectPoints folds points back into the image.
+    """
+    if dist_coeffs is None:
+        return np.inf
+    coeffs = tuple(float(c) for c in np.asarray(dist_coeffs).reshape(-1))
+    return _max_valid_radius(coeffs)
+
+
+def camera_frame_points(points: np.ndarray, pose: Pose) -> np.ndarray:
+    rot_matrix, _ = cv2.Rodrigues(pose.get_rvec())
+    return (rot_matrix @ np.asarray(points).T + pose.get_tvec().reshape(3, 1)).T
+
+
+def projectable_mask(
+    points: np.ndarray,
+    pose: Pose,
+    dist_coeffs: np.ndarray | None = None,
+    depth_eps: float = 1e-6,
+) -> np.ndarray:
+    """Points in front of the camera and inside the region where the distortion model is valid."""
+    camera_points = camera_frame_points(points, pose)
+    depth = camera_points[:, 2]
+    in_front = depth > depth_eps
+    radius = np.full(len(camera_points), np.inf)
+    radius[in_front] = np.hypot(camera_points[in_front, 0], camera_points[in_front, 1]) / depth[in_front]
+    return in_front & (radius <= max_valid_radius(dist_coeffs))
 
 
 def mesh_bbox_corners(mesh: trimesh.Trimesh) -> np.ndarray:
@@ -153,7 +110,7 @@ def camera_origin_in_object_frame(pose: Pose) -> np.ndarray:
     return (-rot_matrix.T @ pose.get_tvec()).reshape(3)
 
 
-def _face_normals_at_points(mesh: trimesh.Trimesh, points: np.ndarray) -> np.ndarray:
+def face_normals_at_points(mesh: trimesh.Trimesh, points: np.ndarray) -> np.ndarray:
     points = np.asarray(points, dtype=np.float64)
     try:
         _, _, face_ids = mesh.nearest.on_surface(points)
@@ -178,193 +135,111 @@ def _face_normals_at_points(mesh: trimesh.Trimesh, points: np.ndarray) -> np.nda
             return normals
 
 
-def _raycast_visible_bruteforce(
-    mesh: trimesh.Trimesh,
-    camera_position: np.ndarray,
-    points: np.ndarray,
-) -> np.ndarray:
-    from trimesh import intersections
-    from trimesh import triangles as triangles_mod
-    from trimesh.constants import tol as tr_tol
+class MeshOccluder:
+    """
+    Exact ray-occlusion test against every triangle of a mesh.
 
-    points = np.asarray(points, dtype=np.float64)
-    n = points.shape[0]
-    cam = np.asarray(camera_position, dtype=np.float64).reshape(3)
-    origins = np.repeat(cam.reshape(1, 3), n, axis=0)
-    vec = points - origins
-    target_dist = np.linalg.norm(vec, axis=1)
-    dirs = vec / np.maximum(target_dist[:, None], 1e-12)
-    tol = max(float(mesh.scale) * 1e-3, 1e-5)
+    All rays of one query start at the same camera position, so the Moller-Trumbore
+    ray/triangle test reduces to three matrix products of the ray directions with
+    per-triangle vectors. That makes testing the full mesh fast enough without a
+    ray-tracing backend, on the GPU when one is available.
+    """
 
-    triangles = mesh.triangles
-    face_normals = mesh.face_normals
-    visible = np.zeros(n, dtype=bool)
-
-    for i in range(n):
-        line_origins = np.tile(origins[i], (len(triangles), 1))
-        line_directions = np.tile(dirs[i], (len(triangles), 1))
-        location, valid = intersections.planes_lines(
-            triangles[:, 0, :],
-            face_normals,
-            line_origins,
-            line_directions,
+    def __init__(
+        self,
+        mesh: trimesh.Trimesh,
+        device: torch.device | None = None,
+        tolerance: float | None = None,
+    ):
+        self.device = (
+            device
+            if device is not None
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
-        if not valid.any():
-            continue
-
-        bary = triangles_mod.points_to_barycentric(triangles[valid], location)
-        hit = np.logical_and(
-            (bary > -tr_tol.zero).all(axis=1),
-            (bary < (1 + tr_tol.zero)).all(axis=1),
-        )
-        if not hit.any():
-            continue
-
-        hit_dist = np.linalg.norm(location[hit] - origins[i], axis=1)
-        forward = hit_dist > 1e-6
-        if not forward.any():
-            continue
-
-        nearest = hit_dist[forward].min()
-        visible[i] = abs(nearest - target_dist[i]) <= tol
-
-    return visible
-
-
-def _raycast_visible_once(
-    mesh: trimesh.Trimesh,
-    camera_position: np.ndarray,
-    points: np.ndarray,
-    allow_fallback: bool,
-    intersector: trimesh.ray.ray_triangle.RayMeshIntersector | None,
-) -> np.ndarray | None:
-    points = np.asarray(points, dtype=np.float64)
-    n = points.shape[0]
-    cam = np.asarray(camera_position, dtype=np.float64).reshape(3)
-    origins = np.repeat(cam.reshape(1, 3), n, axis=0)
-    vec = points - origins
-    dist = np.linalg.norm(vec, axis=1)
-    dirs = vec / np.maximum(dist[:, None], 1e-12)
-    tol = max(float(mesh.scale) * 1e-3, 1e-5)
-
-    ray_mesh = _raycast_mesh(mesh, intersector)
-    if intersector is None:
-        intersector = ray_mesh.ray
-
-    try:
-        loc, idx_ray, _ = intersector.intersects_location(
-            ray_origins=origins,
-            ray_directions=dirs,
-            multiple_hits=False,
-        )
-        visible = np.zeros(n, dtype=bool)
-        if idx_ray.shape[0] == 0:
-            return visible
-
-        hit_dist = np.linalg.norm(loc - origins[idx_ray], axis=1)
-        visible[idx_ray] = np.abs(hit_dist - dist[idx_ray]) <= tol
-        return visible
-    except BaseException as exc:
-        if _can_use_bruteforce_raycast(ray_mesh):
-            try:
-                return _raycast_visible_bruteforce(ray_mesh, camera_position, points)
-            except BaseException:
-                pass
-        else:
-            reason = (
-                "rtree unavailable"
-                if not ray_backend_available()
-                else f"mesh exceeds {_MAX_BRUTEFORCE_FACES} faces"
-            )
-            _warn_ray_fallback(f"{type(exc).__name__}: {exc}; {reason}", ray_mesh)
-
-        if allow_fallback:
-            return np.ones(n, dtype=bool)
-        return None
-
-
-def raycast_visible(
-    mesh: trimesh.Trimesh,
-    camera_position: np.ndarray,
-    points: np.ndarray,
-    allow_fallback: bool = False,
-    intersector: trimesh.ray.ray_triangle.RayMeshIntersector | None = None,
-) -> np.ndarray | None:
-    """Return whether each point is the first surface hit along rays from the camera."""
-    points = np.asarray(points, dtype=np.float64)
-    if points.shape[0] == 0:
-        return np.zeros(0, dtype=bool)
-
-    n = points.shape[0]
-    if n <= _RAY_BATCH_SIZE:
-        return _raycast_visible_once(
-            mesh,
-            camera_position,
-            points,
-            allow_fallback=allow_fallback,
-            intersector=intersector,
+        triangles = torch.from_numpy(np.array(mesh.triangles, dtype=np.float32)).to(self.device)
+        self.v0 = triangles[:, 0]
+        self.e1 = triangles[:, 1] - triangles[:, 0]
+        self.e2 = triangles[:, 2] - triangles[:, 0]
+        self.normal = torch.linalg.cross(self.e2, self.e1)
+        self.tolerance = (
+            tolerance if tolerance is not None else max(float(mesh.scale) * 1e-3, 1e-5)
         )
 
-    visible = np.zeros(n, dtype=bool)
-    for start in range(0, n, _RAY_BATCH_SIZE):
-        end = min(start + _RAY_BATCH_SIZE, n)
-        batch = _raycast_visible_once(
-            mesh,
-            camera_position,
-            points[start:end],
-            allow_fallback=allow_fallback,
-            intersector=intersector,
+    @torch.no_grad()
+    def visible(self, camera_position: np.ndarray, points: np.ndarray) -> np.ndarray:
+        """True for points with no mesh surface between them and the camera."""
+        points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        if points.shape[0] == 0:
+            return np.zeros(0, dtype=bool)
+
+        origin = torch.as_tensor(
+            np.asarray(camera_position, dtype=np.float64).reshape(3),
+            dtype=torch.float32,
+            device=self.device,
         )
-        if batch is None:
-            if allow_fallback:
-                visible[start:end] = True
-                continue
-            return None
-        visible[start:end] = batch
-    return visible
+        # Ray i runs from the camera (t=0) to point i (t=1).
+        rays = torch.as_tensor(points, dtype=torch.float32, device=self.device) - origin
+        t_max = 1.0 - self.tolerance / rays.norm(dim=1).clamp_min(1e-12)
+        occluded = torch.zeros(rays.shape[0], dtype=torch.bool, device=self.device)
+
+        n_triangles = self.v0.shape[0]
+        ray_chunk = max(1, min(rays.shape[0], _OCCLUSION_CHUNK_ELEMENTS // max(n_triangles, 1)))
+        tri_chunk = max(1, _OCCLUSION_CHUNK_ELEMENTS // ray_chunk)
+        for t0 in range(0, n_triangles, tri_chunk):
+            to_origin = origin - self.v0[t0:t0 + tri_chunk]
+            e1 = self.e1[t0:t0 + tri_chunk]
+            e2 = self.e2[t0:t0 + tri_chunk]
+            u_vec = torch.linalg.cross(e2, to_origin)
+            v_vec = torch.linalg.cross(to_origin, e1)
+            t_num = (e2 * v_vec).sum(dim=1)
+            normal = self.normal[t0:t0 + tri_chunk]
+            for r0 in range(0, rays.shape[0], ray_chunk):
+                d = rays[r0:r0 + ray_chunk]
+                inv_det = 1.0 / (d @ normal.T)
+                u = (d @ u_vec.T) * inv_det
+                v = (d @ v_vec.T) * inv_det
+                t = t_num * inv_det
+                # Parallel rays give inf/nan and fail every comparison.
+                hit = (
+                    (u >= -1e-6)
+                    & (v >= -1e-6)
+                    & (u + v <= 1.0 + 1e-6)
+                    & (t > 0.0)
+                    & (t < t_max[r0:r0 + ray_chunk, None])
+                )
+                occluded[r0:r0 + ray_chunk] |= hit.any(dim=1)
+        return (~occluded).cpu().numpy()
 
 
 def keypoint_visibility(
     mesh: trimesh.Trimesh,
     points: np.ndarray,
     pose: Pose,
+    occluder: MeshOccluder | None = None,
+    normals: np.ndarray | None = None,
     depth_eps: float = 1e-6,
     facing_eps: float = 0.0,
 ) -> np.ndarray:
     """
     Per-keypoint visibility from the pose camera: in front, facing, unoccluded.
+    Pass ``occluder`` and ``normals`` when calling repeatedly for the same mesh and points.
     """
     points = np.asarray(points, dtype=np.float64)
-    n = points.shape[0]
-    visible = np.zeros(n, dtype=bool)
+    visible = np.zeros(points.shape[0], dtype=bool)
 
-    rot_matrix, _ = cv2.Rodrigues(pose.get_rvec())
-    in_front = (
-        (rot_matrix @ points.T) + pose.get_tvec().reshape(3, 1)
-    ).T[:, 2] > depth_eps
+    in_front = camera_frame_points(points, pose)[:, 2] > depth_eps
     if not np.any(in_front):
         return visible
 
     cam_origin = camera_origin_in_object_frame(pose)
-    normals = _face_normals_at_points(mesh, points)
+    if normals is None:
+        normals = face_normals_at_points(mesh, points)
     facing = np.einsum("ij,ij->i", normals, cam_origin - points) > facing_eps
     candidates = in_front & facing
     if not np.any(candidates):
         return visible
 
-    cand_idx = np.flatnonzero(candidates)
-    intersector = create_ray_intersector(mesh)
-    unoccluded = raycast_visible(
-        mesh,
-        cam_origin,
-        points[candidates],
-        allow_fallback=False,
-        intersector=intersector,
-    )
-    if unoccluded is None:
-        logger.warning("Mesh ray tracing unavailable; using depth and facing only.")
-        visible[candidates] = True
-    else:
-        visible[cand_idx] = unoccluded
-
+    if occluder is None:
+        occluder = MeshOccluder(mesh)
+    visible[candidates] = occluder.visible(cam_origin, points[candidates])
     return visible

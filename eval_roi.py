@@ -15,7 +15,13 @@ def parse_args():
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("-k", type=int, default=200, help="Number of samples to evaluate.")
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
-    parser.add_argument("--start-idx", type=int, default=2300)
+    parser.add_argument(
+        "--part",
+        choices=("test", "val", "train"),
+        default="test",
+        help="Which recordings of the default split to draw samples from.",
+    )
+    parser.add_argument("--start-idx", type=int, default=0, help="Offset into that part's frames.")
     parser.add_argument("--margin", type=float, default=1.3)
     parser.add_argument("--mesh-scale", type=float, default=0.001)
     parser.add_argument(
@@ -40,8 +46,8 @@ def main():
     )
     roi_dataset = loader.get_roi_dataset(margin=args.margin)
 
-    for i in range(args.k):
-        idx = args.start_idx + i
+    indices = loader.split_by_recording().indices(loader.data, args.part)
+    for idx in indices[args.start_idx:args.start_idx + args.k]:
         image, gt_roi = roi_dataset[idx]
 
         pred_roi = model.inference(image.unsqueeze(0).to(device))[0]

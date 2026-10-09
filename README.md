@@ -68,6 +68,29 @@ keypoint_heatmap_20/
   keypoints/keypoints.npz
 ```
 
+## Train and evaluate the full pipeline
+
+`train.py` runs both ROI stages and both keypoint stages into one run directory:
+
+```bash
+python train.py --dataset data/Astrobee --epochs 20
+```
+
+Data is split by recording, not by frame, so near-identical neighbouring frames never land
+in both training and validation. By default 70% of recordings train, 15% validate (checkpoint
+selection) and 15% are held out for testing (`--val-fraction`, `--test-fraction`, `--split-seed`).
+The split is saved in the run's `config.json`. The per-stage scripts above use the same default split.
+
+Evaluate the run on its held-out test recordings:
+
+```bash
+python eval_pipe.py --run-dir pose_estimator_20 --dataset data/Astrobee
+```
+
+It reports how often a pose is returned, the translation and rotation error, and the share of
+frames within `--max-translation-error` (default 5 cm) and `--max-rotation-error` (default 5°).
+`--csv results.csv` writes per-frame results.
+
 ## Dataset layout
 
 ```

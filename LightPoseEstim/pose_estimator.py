@@ -5,7 +5,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 from scipy.spatial.transform import Rotation
 from torchvision.transforms import ToTensor
@@ -15,14 +14,21 @@ from .keypoint_selector import (
     load_canonical_keypoints,
     paths_from_keypoint_run_dir,
 )
-from .kp.keypoint_heatmap import KeypointHeatmapNet
+from .crop import crop_and_resize, crop_box, crop_to_image
+from .kp.keypoint_heatmap import DEFAULT_PEAK_THRESHOLD, KeypointHeatmapNet
 from .pose import Pose
-from .projection import as_dist_coeffs
+from .projection import as_dist_coeffs, project_points, projectable_mask
 from .roi import ROI, roi_to_bbox
 from .roi.roi_detector import ROIDetector
 
 ROI_CHECKPOINT_RELATIVE = Path("roi") / "roi_detector.pth"
 RUN_CONFIG_RELATIVE = Path("config.json")
+
+# PnP outlier threshold: this many heatmap cells, mapped to full-image pixels.
+_REPROJECTION_ERROR_CELLS = 2.0
+_MIN_REPROJECTION_ERROR_PX = 4.0
+# 4 points always fit some pose, so a 5th is needed to reject outliers at all.
+_MIN_PNP_INLIERS = 5
 
 
 @dataclass
@@ -42,7 +48,7 @@ class PoseEstimator:
         camera_intrinsics: np.ndarray,
         distortion_coeffs: np.ndarray | None = None,
         crop_size: int = 256,
-        peak_threshold: float = 0.1,
+        peak_threshold: float = DEFAULT_PEAK_THRESHOLD,
         device: torch.device | None = None,
     ):
         self.roi_detector = roi_detector
@@ -75,7 +81,7 @@ class PoseEstimator:
         keypoints_path: str | Path | None = None,
         distortion_coeffs: np.ndarray | None = None,
         crop_size: int = 256,
-        peak_threshold: float = 0.1,
+        peak_threshold: float = DEFAULT_PEAK_THRESHOLD,
         device: torch.device | None = None,
     ) -> "PoseEstimator":
         if keypoint_run_dir is not None:
@@ -115,7 +121,7 @@ class PoseEstimator:
         run_dir: str | Path,
         camera_intrinsics: np.ndarray,
         distortion_coeffs: np.ndarray | None = None,
-        peak_threshold: float = 0.1,
+        peak_threshold: float = DEFAULT_PEAK_THRESHOLD,
         device: torch.device | None = None,
     ) -> "PoseEstimator":
         run_dir = Path(run_dir)
@@ -147,20 +153,30 @@ class PoseEstimator:
 
     def _estimate_one(self, image: torch.Tensor) -> PoseEstimationResult:
         image = image.to(self.device)
+        _, height, width = image.shape
         roi = self.roi_detector.inference(image.unsqueeze(0))[0]
-        crop, crop_box = self._crop_and_resize(image, roi, self.crop_size)
+        if self._roi_outside_frame(roi, height, width):
+            return self._discarded_pose(roi)
 
-        coordinates, confidence = self.keypoint_net.inference(
+        box = crop_box(roi, height, width)
+        crop = crop_and_resize(image, box, self.crop_size)
+        cells, confidence = self.keypoint_net.inference(
             crop.unsqueeze(0),
             threshold=self.peak_threshold,
         )
-        image_points = self._map_to_full_image(
-            coordinates[0].cpu().numpy(),
-            crop_box,
-            self.crop_size,
-        )
+        stride = self.keypoint_net.stride
+        image_points = crop_to_image(
+            cells[0].cpu().numpy(),
+            box,
+            (self.crop_size, self.crop_size),
+            stride=stride,
+        ).astype(np.float32)
         confidence = confidence[0].cpu().numpy()
-        pose = self._solve_pose(image_points, confidence)
+        cell_px = stride * max(box[2] - box[0], box[3] - box[1]) / self.crop_size
+        max_error = max(_MIN_REPROJECTION_ERROR_PX, _REPROJECTION_ERROR_CELLS * cell_px)
+        pose = self._solve_pose(image_points, confidence, max_error)
+        if pose is not None and self._pose_outside_fov(pose, height, width):
+            pose = None
         return PoseEstimationResult(
             pose=pose,
             roi=roi,
@@ -168,72 +184,90 @@ class PoseEstimator:
             confidence=confidence,
         )
 
+    def _discarded_pose(self, roi: ROI) -> PoseEstimationResult:
+        count = len(self.keypoints)
+        return PoseEstimationResult(
+            pose=None,
+            roi=roi,
+            image_points=np.zeros((count, 2), dtype=np.float32),
+            confidence=np.zeros(count, dtype=np.float32),
+        )
+
+    @staticmethod
+    def _roi_outside_frame(roi: ROI, height: int, width: int) -> bool:
+        if roi.w <= 1.0 or roi.h <= 1.0:
+            return True
+        bbox = roi_to_bbox(roi)
+        x1 = max(bbox.x1, 0.0)
+        y1 = max(bbox.y1, 0.0)
+        x2 = min(bbox.x2, float(width))
+        y2 = min(bbox.y2, float(height))
+        return x2 - x1 <= 1.0 or y2 - y1 <= 1.0
+
+    def _pose_outside_fov(self, pose: Pose, height: int, width: int) -> bool:
+        projectable = projectable_mask(self.object_points, pose, self.distortion_coeffs)
+        if not np.any(projectable):
+            return True
+        projected = project_points(
+            self.object_points[projectable],
+            pose,
+            self.camera_intrinsics,
+            self.distortion_coeffs,
+        )
+        inside = (
+            (projected[:, 0] >= 0) & (projected[:, 0] < width)
+            & (projected[:, 1] >= 0) & (projected[:, 1] < height)
+        )
+        return not bool(np.any(inside))
+
     def _solve_pose(
         self,
         image_points: np.ndarray,
         confidence: np.ndarray,
+        max_error: float,
     ) -> Pose | None:
+        """RANSAC PnP; keypoints reprojecting more than ``max_error`` px away are outliers."""
         valid = confidence >= self.peak_threshold
-        if int(valid.sum()) < 4:
+        if int(valid.sum()) < _MIN_PNP_INLIERS:
             return None
 
         object_points = self.object_points[valid]
         points_2d = image_points[valid].reshape(-1, 1, 2).astype(np.float32)
-        success, rvec, tvec = cv2.solvePnP(
+        dist_coeffs = as_dist_coeffs(self.distortion_coeffs)
+        success, rvec, tvec, _ = cv2.solvePnPRansac(
             object_points,
             points_2d,
             self.camera_intrinsics,
-            as_dist_coeffs(self.distortion_coeffs),
-            flags=cv2.SOLVEPNP_ITERATIVE,
+            dist_coeffs,
+            iterationsCount=100,
+            reprojectionError=max_error,
+            confidence=0.99,
+            flags=cv2.SOLVEPNP_SQPNP,
         )
         if not success:
             return None
+
+        # With 4 or 5 points OpenCV solves directly and reports every point as an
+        # inlier, so count inliers from the reprojection error here.
+        reprojected, _ = cv2.projectPoints(
+            object_points, rvec, tvec, self.camera_intrinsics, dist_coeffs
+        )
+        inliers = np.linalg.norm(reprojected - points_2d, axis=2).ravel() <= max_error
+        if int(inliers.sum()) < _MIN_PNP_INLIERS:
+            return None
+        rvec, tvec = cv2.solvePnPRefineLM(
+            object_points[inliers],
+            points_2d[inliers],
+            self.camera_intrinsics,
+            dist_coeffs,
+            rvec,
+            tvec,
+        )
 
         rotation, _ = cv2.Rodrigues(rvec)
         qx, qy, qz, qw = Rotation.from_matrix(rotation).as_quat()
         t = tvec.reshape(3)
         return Pose(float(t[0]), float(t[1]), float(t[2]), qx, qy, qz, qw)
-
-    @staticmethod
-    def _crop_and_resize(
-        image: torch.Tensor,
-        roi: ROI,
-        crop_size: int,
-    ) -> tuple[torch.Tensor, tuple[int, int, int, int]]:
-        _, height, width = image.shape
-        bbox = roi_to_bbox(roi)
-        x1 = int(max(0, np.floor(bbox.x1)))
-        y1 = int(max(0, np.floor(bbox.y1)))
-        x2 = int(min(width, np.ceil(bbox.x2)))
-        y2 = int(min(height, np.ceil(bbox.y2)))
-        if x2 <= x1:
-            x2 = min(width, x1 + 1)
-        if y2 <= y1:
-            y2 = min(height, y1 + 1)
-
-        crop = image[:, y1:y2, x1:x2]
-        crop = F.interpolate(
-            crop.unsqueeze(0),
-            size=(crop_size, crop_size),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0)
-        return crop, (x1, y1, x2, y2)
-
-    @staticmethod
-    def _map_to_full_image(
-        coordinates: np.ndarray,
-        crop_box: tuple[int, int, int, int],
-        crop_size: int,
-    ) -> np.ndarray:
-        x1, y1, x2, y2 = crop_box
-        crop_w = max(x2 - x1, 1)
-        crop_h = max(y2 - y1, 1)
-        scale_x = crop_w / crop_size
-        scale_y = crop_h / crop_size
-        x = x1 + coordinates[:, 0] * scale_x
-        y = y1 + coordinates[:, 1] * scale_y
-        return np.stack([x, y], axis=1).astype(np.float32)
 
     def _to_batch(self, image) -> list[torch.Tensor]:
         if isinstance(image, (list, tuple)):

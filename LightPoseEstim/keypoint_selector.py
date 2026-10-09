@@ -9,7 +9,7 @@ from typing import Optional
 import numpy as np
 import trimesh
 
-from .projection import create_ray_intersector, ray_backend_available, raycast_visible
+from .projection import MeshOccluder
 
 
 @dataclass
@@ -222,19 +222,14 @@ class MeshKeypointSelector:
         if k_final <= 0:
             raise ValueError("keypoint_count must be > 0")
 
-        if not ray_backend_available():
-            logging.warning(
-                "rtree is not available; keypoint visibility scoring will use heuristics."
-            )
-
-        ray_intersector = create_ray_intersector(mesh)
+        occluder = MeshOccluder(mesh)
 
         candidates = self._sample_candidates(mesh, self.candidate_count)
         visibility_ratio, stability_ratio = self._simulate_coverage(
-            mesh, candidates, ray_intersector
+            mesh, candidates, occluder
         )
         external_surface_ratio = self._estimate_external_surface_visibility(
-            mesh, candidates, ray_intersector
+            mesh, candidates, occluder
         )
         distinctiveness = self._compute_distinctiveness(candidates)
         geometric_usefulness = self._compute_geometric_usefulness(candidates, mesh)
@@ -286,7 +281,7 @@ class MeshKeypointSelector:
                     stability_prior=float(scores.stability[idx]),
                 )
             )
-        del ray_intersector
+        del occluder
         return output
 
     def show_keypoints(
@@ -396,7 +391,7 @@ class MeshKeypointSelector:
         self,
         mesh: trimesh.Trimesh,
         candidates: CandidatePool,
-        ray_intersector: trimesh.ray.ray_triangle.RayMeshIntersector | None,
+        occluder: MeshOccluder,
     ) -> tuple[np.ndarray, np.ndarray]:
         points = candidates.points
         normals = candidates.normals
@@ -425,18 +420,8 @@ class MeshKeypointSelector:
             if facing_idx.shape[0] == 0:
                 continue
 
-            ray_visible = self._raycast_visible(
-                mesh,
-                cam_pos,
-                points[facing_idx],
-                allow_fallback=True,
-                intersector=ray_intersector,
-            )
-            if ray_visible is None:
-                ray_visible = np.ones(facing_idx.shape[0], dtype=bool)
-
             visible = np.zeros(n, dtype=bool)
-            visible[facing_idx] = ray_visible
+            visible[facing_idx] = occluder.visible(cam_pos, points[facing_idx])
 
             # Simulated random crops/truncations in projected coordinates.
             in_crop = self._simulate_crop(points, centroid, view_dir)
@@ -525,12 +510,12 @@ class MeshKeypointSelector:
         self,
         mesh: trimesh.Trimesh,
         candidates: CandidatePool,
-        ray_intersector: trimesh.ray.ray_triangle.RayMeshIntersector | None,
+        occluder: MeshOccluder,
     ) -> np.ndarray:
         """
         Estimate how likely each candidate belongs to externally visible surface.
-        Uses strict ray visibility from outside views. If ray tracing backend is
-        unavailable, falls back to an outward-normal heuristic.
+        Uses strict ray visibility from outside views. If no view sees any candidate,
+        falls back to an outward-normal heuristic.
         """
         points = candidates.points
         normals = candidates.normals
@@ -548,7 +533,6 @@ class MeshKeypointSelector:
 
         visible_count = np.zeros(n, dtype=np.float64)
         valid_views = 0
-        ray_backend_ok = False
 
         for view_dir in directions:
             cam_pos = centroid + radius * view_dir
@@ -559,24 +543,12 @@ class MeshKeypointSelector:
             if facing_idx.shape[0] == 0:
                 continue
 
-            ray_visible = self._raycast_visible(
-                mesh,
-                cam_pos,
-                points[facing_idx],
-                allow_fallback=False,
-                intersector=ray_intersector,
-            )
-            if ray_visible is None:
-                # Ray backend unavailable in this environment.
-                continue
-
-            ray_backend_ok = True
             visible = np.zeros(n, dtype=bool)
-            visible[facing_idx] = ray_visible
+            visible[facing_idx] = occluder.visible(cam_pos, points[facing_idx])
             visible_count += visible.astype(np.float64)
             valid_views += 1
 
-        if ray_backend_ok and valid_views > 0:
+        if valid_views > 0:
             return self._normalize(visible_count / valid_views)
         return outward_score
 
@@ -614,22 +586,6 @@ class MeshKeypointSelector:
             min_dist = np.minimum(min_dist, d)
 
         return np.array(selected, dtype=np.int64)
-
-    def _raycast_visible(
-        self,
-        mesh: trimesh.Trimesh,
-        camera_position: np.ndarray,
-        points: np.ndarray,
-        allow_fallback: bool = True,
-        intersector: trimesh.ray.ray_triangle.RayMeshIntersector | None = None,
-    ) -> Optional[np.ndarray]:
-        return raycast_visible(
-            mesh,
-            camera_position,
-            points,
-            allow_fallback=allow_fallback,
-            intersector=intersector,
-        )
 
     def _simulate_crop(
         self, points: np.ndarray, center: np.ndarray, view_dir: np.ndarray

@@ -2,7 +2,8 @@ import argparse
 import logging
 from pathlib import Path
 
-from LightPoseEstim import DataLoader, project_mesh_vertices, visualize_roi
+from LightPoseEstim import DataLoader, project_points, visualize_roi
+from LightPoseEstim.projection import projectable_mask
 
 DEFAULT_DATASET = Path(__file__).resolve().parent / "data" / "Astrobee"
 
@@ -34,8 +35,11 @@ def main():
     image, roi = roi_dataset[args.sample_idx]
     row = loader.data.iloc[args.sample_idx]
 
-    projected_points = project_mesh_vertices(
-        loader.mesh,
+    vertices = loader.mesh.vertices[
+        projectable_mask(loader.mesh.vertices, row["pose"], row["distortion_coeffs"])
+    ]
+    projected_points = project_points(
+        vertices,
         row["pose"],
         row["camera_intrinsics"],
         row["distortion_coeffs"],

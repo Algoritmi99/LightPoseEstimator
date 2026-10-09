@@ -12,6 +12,11 @@ from LightPoseEstim import (
     ROIDetectorTrainer,
     save_canonical_keypoints,
 )
+from LightPoseEstim.dataloader import (
+    DEFAULT_SPLIT_SEED,
+    DEFAULT_TEST_FRACTION,
+    DEFAULT_VAL_FRACTION,
+)
 from LightPoseEstim.keypoint_selector import KEYPOINTS_FILENAME, KEYPOINTS_SUBDIR, NET_SUBDIR
 from LightPoseEstim.pose_estimator import ROI_CHECKPOINT_RELATIVE, RUN_CONFIG_RELATIVE
 
@@ -38,6 +43,37 @@ def parse_args():
         help="Do not translate mesh so its bbox center is at the origin.",
     )
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=DEFAULT_VAL_FRACTION,
+        help="Share of recordings held out for checkpoint selection.",
+    )
+    parser.add_argument(
+        "--test-fraction",
+        type=float,
+        default=DEFAULT_TEST_FRACTION,
+        help="Share of recordings held out for eval_pipe.py; never used in training.",
+    )
+    parser.add_argument("--split-seed", type=int, default=DEFAULT_SPLIT_SEED)
+    parser.add_argument(
+        "--roi-batch-size",
+        type=int,
+        default=64,
+        help="ROI batch size. 64 uses about 24 GB on 1280x960 images.",
+    )
+    parser.add_argument(
+        "--kp-batch-size",
+        type=int,
+        default=48,
+        help="Keypoint batch size. 48 uses about 1.5 GB on 256x256 crops.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Data-loader worker processes. Overlaps image loading with GPU training.",
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -84,14 +120,34 @@ def main():
     ):
         path.parent.mkdir(parents=True, exist_ok=True)
 
+    split = loader.split_by_recording(
+        val_fraction=args.val_fraction,
+        test_fraction=args.test_fraction,
+        seed=args.split_seed,
+    )
+    logging.info(
+        "Split by recording: %d train, %d val, %d test",
+        len(split.train),
+        len(split.val),
+        len(split.test),
+    )
+
     use_tensorboard = not args.no_tensorboard
     log_root = Path("runs") / run_dir.name
 
     roi_dataset = loader.get_roi_dataset(margin=args.margin)
-    logging.info("ROI stage 0: training for %d epochs (freeze_backbone=True)", args.epochs)
+    logging.info(
+        "ROI stage 0: training for %d epochs (freeze_backbone=True, batch_size=%d, workers=%d)",
+        args.epochs,
+        args.roi_batch_size,
+        args.workers,
+    )
     logging.info("Saving ROI stage-0 checkpoint to %s", roi_stage0_path)
     ROIDetectorTrainer(
         roi_dataset,
+        batch_size=args.roi_batch_size,
+        num_workers=args.workers,
+        split=split,
         use_tensorboard=use_tensorboard,
         tensorboard_log_dir=str(log_root / "roi"),
     ).train(
@@ -110,6 +166,9 @@ def main():
     ROIDetectorTrainer(
         roi_dataset,
         model=ROIDetector.load(roi_stage0_path),
+        batch_size=args.roi_batch_size,
+        num_workers=args.workers,
+        split=split,
         use_tensorboard=use_tensorboard,
         tensorboard_log_dir=str(log_root / "roi_finetune"),
         optimizer_kwargs=dict(lr=FINE_TUNE_LR),
@@ -132,12 +191,17 @@ def main():
     )
 
     logging.info(
-        "Keypoint stage 0: training for %d epochs (freeze_backbone=True)",
+        "Keypoint stage 0: training for %d epochs (freeze_backbone=True, batch_size=%d, workers=%d)",
         args.epochs,
+        args.kp_batch_size,
+        args.workers,
     )
     logging.info("Saving keypoint stage-0 checkpoint to %s", keypoint_stage0_path)
     KeypointHeatmapTrainer(
         kp_dataset,
+        batch_size=args.kp_batch_size,
+        num_workers=args.workers,
+        split=split,
         use_tensorboard=use_tensorboard,
         tensorboard_log_dir=str(log_root / "keypoints"),
     ).train(
@@ -159,6 +223,9 @@ def main():
             keypoint_stage0_path,
             num_keypoints=len(keypoints),
         ),
+        batch_size=args.kp_batch_size,
+        num_workers=args.workers,
+        split=split,
         use_tensorboard=use_tensorboard,
         tensorboard_log_dir=str(log_root / "keypoints_finetune"),
         optimizer_kwargs=dict(lr=FINE_TUNE_LR),
@@ -169,7 +236,15 @@ def main():
     )
 
     config_path = run_dir / RUN_CONFIG_RELATIVE
-    config_path.write_text(json.dumps({"crop_size": args.crop_size}, indent=2) + "\n")
+    config = {
+        "crop_size": args.crop_size,
+        "margin": args.margin,
+        "mesh_scale": args.mesh_scale,
+        "recenter_mesh": not args.no_recenter_mesh,
+        "split_seed": args.split_seed,
+        "split": split.to_dict(),
+    }
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
     logging.info("Saved pose estimator run to %s", run_dir)
 
 

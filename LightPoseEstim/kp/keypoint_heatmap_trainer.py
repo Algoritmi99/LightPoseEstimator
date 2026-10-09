@@ -3,12 +3,12 @@ from pathlib import Path
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from ..dataloader import ImageKPHeatmapROIDataset
-from .keypoint_heatmap import KeypointHeatmapNet
+from ..dataloader import ImageKPHeatmapROIDataset, RecordingSplit, split_by_recording
+from .keypoint_heatmap import HeatmapFocalLoss, KeypointHeatmapNet
 
 
 class KeypointHeatmapTrainer:
@@ -16,24 +16,39 @@ class KeypointHeatmapTrainer:
         self,
         dataset: ImageKPHeatmapROIDataset,
         model: KeypointHeatmapNet | type[KeypointHeatmapNet] | None = None,
-        train_size: float = 0.8,
+        split: RecordingSplit | None = None,
         batch_size: int = 32,
-        criterion: nn.Module = nn.MSELoss(),
+        num_workers: int = 0,
+        criterion: nn.Module = HeatmapFocalLoss(),
         optimizer_cls: type[torch.optim.Optimizer] = torch.optim.Adam,
         optimizer_kwargs: dict | None = None,
         device: torch.device | None = None,
         use_tensorboard: bool = False,
         tensorboard_log_dir: str = "runs/keypoint_heatmap",
+        augment: bool = True,
     ):
-        train_size = int(len(dataset) * train_size)
-        val_size = len(dataset) - train_size
-        train_dataset, val_dataset = random_split(
-            dataset,
-            [train_size, val_size],
+        self.device = (
+            device
+            if device is not None
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
         self.batch_size = batch_size
-        self.train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        self.val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        self.pin_memory = self.device.type == "cuda"
+
+        if split is None:
+            split = split_by_recording(dataset.df)
+        # Augment training crops only; validation measures clean crops.
+        train_dataset = Subset(dataset.with_augmentation(augment), split.indices(dataset.df, "train"))
+        val_dataset = Subset(dataset.with_augmentation(False), split.indices(dataset.df, "val"))
+        loader_kwargs = dict(
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=self.pin_memory,
+        )
+        if num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+        self.train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+        self.val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
 
         if model is None:
             model = KeypointHeatmapNet(num_keypoints=len(dataset.keypoints))
@@ -50,11 +65,6 @@ class KeypointHeatmapTrainer:
                 raise ValueError(f"Pass in optimizer_kwargs for {optimizer_cls}")
         self.optimizer = optimizer_cls(self.model.parameters(), **optimizer_kwargs)
 
-        self.device = (
-            device
-            if device is not None
-            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        )
         self.model.to(self.device)
 
         self.use_tensorboard = use_tensorboard
@@ -65,8 +75,8 @@ class KeypointHeatmapTrainer:
         total_loss = 0.0
         num_batches = len(self.train_loader)
         for batch_idx, (images, heatmaps) in enumerate(self.train_loader):
-            images = images.to(self.device)
-            heatmaps = heatmaps.to(self.device)
+            images = images.to(self.device, non_blocking=self.pin_memory)
+            heatmaps = heatmaps.to(self.device, non_blocking=self.pin_memory)
 
             predictions = self.model(images)
             loss = self.criterion(predictions, heatmaps)
@@ -92,8 +102,8 @@ class KeypointHeatmapTrainer:
         num_batches = len(self.val_loader)
 
         for batch_idx, (images, heatmaps) in enumerate(self.val_loader):
-            images = images.to(self.device)
-            heatmaps = heatmaps.to(self.device)
+            images = images.to(self.device, non_blocking=self.pin_memory)
+            heatmaps = heatmaps.to(self.device, non_blocking=self.pin_memory)
 
             predictions = self.model(images)
             loss = self.criterion(predictions, heatmaps)

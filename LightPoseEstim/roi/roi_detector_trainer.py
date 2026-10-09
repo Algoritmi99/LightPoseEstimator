@@ -1,13 +1,13 @@
 import logging
 from pathlib import Path
 
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 import torch
 from torch import nn
 from tqdm import tqdm
 
-from ..dataloader import ImageROIDataset
+from ..dataloader import ImageROIDataset, RecordingSplit, split_by_recording
 from .roi_detector import ROIDetector
 
 
@@ -15,8 +15,9 @@ class ROIDetectorTrainer:
     def __init__(self,
                  dataset: ImageROIDataset,
                  model: ROIDetector | type[ROIDetector] = ROIDetector,
-                 train_size: float = 0.8,
+                 split: RecordingSplit | None = None,
                  batch_size: int = 32,
+                 num_workers: int = 0,
                  criterion: nn.Module = nn.SmoothL1Loss(),
                  optimizer_cls: type[torch.optim.Optimizer] = torch.optim.Adam,
                  optimizer_kwargs: dict | None = None,
@@ -25,16 +26,28 @@ class ROIDetectorTrainer:
                  tensorboard_log_dir: str = "runs/roi_detector",
                  ):
 
-        # Build DataLoaders
-        train_size = int(len(dataset) * train_size)
-        val_size = len(dataset) - train_size
-        train_dataset, val_dataset = random_split(
-            dataset,
-            [train_size, val_size]
+        self.device = (
+            device
+            if device is not None
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
         self.batch_size = batch_size
-        self.train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        self.val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        self.pin_memory = self.device.type == "cuda"
+
+        # Build DataLoaders
+        if split is None:
+            split = split_by_recording(dataset.df)
+        train_dataset = Subset(dataset, split.indices(dataset.df, "train"))
+        val_dataset = Subset(dataset, split.indices(dataset.df, "val"))
+        loader_kwargs = dict(
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=self.pin_memory,
+        )
+        if num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+        self.train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+        self.val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
 
         # Build Model
         self.model = model() if isinstance(model, type) else model
@@ -50,12 +63,6 @@ class ROIDetectorTrainer:
                 raise ValueError(f"Pass in optimizer_kwargs for {optimizer_cls}")
         self.optimizer = optimizer_cls(self.model.parameters(), **optimizer_kwargs)
 
-        # Store Device
-        self.device = (
-            device
-            if device is not None
-            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        )
         self.model.to(self.device)
 
         self.use_tensorboard = use_tensorboard
@@ -66,8 +73,8 @@ class ROIDetectorTrainer:
         total_loss = 0.0
         num_batches = len(self.train_loader)
         for batch_idx, (images, rois) in enumerate(self.train_loader):
-            images = images.to(self.device)
-            rois = rois.to(self.device)
+            images = images.to(self.device, non_blocking=self.pin_memory)
+            rois = rois.to(self.device, non_blocking=self.pin_memory)
 
             predictions = self.model(images)
             loss = self.criterion(predictions, rois)
@@ -93,8 +100,8 @@ class ROIDetectorTrainer:
         num_batches = len(self.val_loader)
 
         for batch_idx, (images, rois) in enumerate(self.val_loader):
-            images = images.to(self.device)
-            rois = rois.to(self.device)
+            images = images.to(self.device, non_blocking=self.pin_memory)
+            rois = rois.to(self.device, non_blocking=self.pin_memory)
 
             predictions = self.model(images)
 

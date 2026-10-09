@@ -1,24 +1,82 @@
+import copy
 import json
 import logging
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-import cv2
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 import torchvision.transforms as T
 import trimesh
 from PIL import Image
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
+from .crop import HEATMAP_STRIDE, Box, crop_and_resize, crop_box, image_to_crop
 from .pose import Pose
-from .projection import keypoint_visibility, mesh_bbox_corners, project_points
-from .roi import BBox, ROI, bbox_to_roi, normalize_roi, roi_to_bbox
+from .projection import (
+    MeshOccluder,
+    camera_frame_points,
+    face_normals_at_points,
+    keypoint_visibility,
+    mesh_bbox_corners,
+    project_points,
+    projectable_mask,
+)
+from .roi import BBox, ROI, bbox_to_roi, normalize_roi
 from .keypoint_selector import CanonicalKeypoint
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_VAL_FRACTION = 0.15
+DEFAULT_TEST_FRACTION = 0.15
+DEFAULT_SPLIT_SEED = 0
+
+
+@dataclass(frozen=True)
+class RecordingSplit:
+    """Train/val/test recording names. Whole recordings go to one split, so near-duplicate frames never leak."""
+    train: tuple[str, ...]
+    val: tuple[str, ...]
+    test: tuple[str, ...]
+
+    def indices(self, data: pd.DataFrame, part: str) -> list[int]:
+        """Row positions of ``data`` whose recording is in ``part`` (train, val or test)."""
+        recordings = set(getattr(self, part))
+        return np.flatnonzero(data["recording"].isin(recordings).to_numpy()).tolist()
+
+    def to_dict(self) -> dict:
+        return {"train": list(self.train), "val": list(self.val), "test": list(self.test)}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "RecordingSplit":
+        return cls(tuple(data["train"]), tuple(data["val"]), tuple(data["test"]))
+
+
+def split_by_recording(
+    data: pd.DataFrame,
+    val_fraction: float = DEFAULT_VAL_FRACTION,
+    test_fraction: float = DEFAULT_TEST_FRACTION,
+    seed: int = DEFAULT_SPLIT_SEED,
+) -> RecordingSplit:
+    recordings = sorted(data["recording"].unique())
+    np.random.default_rng(seed).shuffle(recordings)
+    n_test = round(len(recordings) * test_fraction)
+    n_val = round(len(recordings) * val_fraction)
+    if n_test + n_val >= len(recordings):
+        raise ValueError(
+            f"Cannot split {len(recordings)} recordings into "
+            f"val={val_fraction} and test={test_fraction} with any left for training."
+        )
+    if val_fraction > 0 and n_val == 0:
+        raise ValueError(f"val_fraction={val_fraction} selects no recordings out of {len(recordings)}.")
+    return RecordingSplit(
+        train=tuple(sorted(recordings[n_test + n_val:])),
+        val=tuple(sorted(recordings[n_test:n_test + n_val])),
+        test=tuple(sorted(recordings[:n_test])),
+    )
 
 
 def _find_image(image_dir: Path, timestamp, suffix: str = "") -> list[Path]:
@@ -62,27 +120,38 @@ def _get_2d_roi(
     height, width = img_shape[-2:]
     bbox_3d = mesh_bbox_corners(mesh)
 
-    rot_matrix, _ = cv2.Rodrigues(pose.get_rvec())
-    camera_points = (rot_matrix @ bbox_3d.T + pose.get_tvec().reshape(3, 1)).T
+    camera_points = camera_frame_points(bbox_3d, pose)
     in_front_mask = camera_points[:, 2] > 1e-6
     if int(np.sum(in_front_mask)) < 2:
-        logger.warning(
-            "Object is behind the camera; returning zero ROI. tvec=%s",
-            pose.get_tvec().ravel().tolist(),
-        )
         return ROI(0.0, 0.0, 0.0, 0.0)
 
-    image_points = project_points(
-        bbox_3d[in_front_mask],
-        pose,
-        camera_intrinsics,
-        dist_coeffs,
-    )
+    projectable = projectable_mask(bbox_3d, pose, dist_coeffs)
+    image_points = [np.empty((0, 2), dtype=np.float32)]
+    if projectable.any():
+        image_points.append(
+            project_points(bbox_3d[projectable], pose, camera_intrinsics, dist_coeffs)
+        )
+    # Corners past the distortion fold would be projected back into the image.
+    # They lie outside it along their own direction, so push them past the edge.
+    beyond_fold = in_front_mask & ~projectable
+    if beyond_fold.any():
+        focal = np.diag(camera_intrinsics)[:2]
+        direction = camera_points[beyond_fold, :2] / camera_points[beyond_fold, 2:3] * focal
+        direction /= np.linalg.norm(direction, axis=1, keepdims=True)
+        image_points.append(camera_intrinsics[:2, 2] + direction * float(width + height))
+    image_points = np.concatenate(image_points)
 
-    x1 = float(np.clip(image_points[:, 0].min(), 0, width - 1))
-    x2 = float(np.clip(image_points[:, 0].max(), 0, width - 1))
-    y1 = float(np.clip(image_points[:, 1].min(), 0, height - 1))
-    y2 = float(np.clip(image_points[:, 1].max(), 0, height - 1))
+    x1 = float(image_points[:, 0].min())
+    x2 = float(image_points[:, 0].max())
+    y1 = float(image_points[:, 1].min())
+    y2 = float(image_points[:, 1].max())
+    if x2 < 0 or y2 < 0 or x1 > width - 1 or y1 > height - 1:
+        return ROI(0.0, 0.0, 0.0, 0.0)
+
+    x1 = float(np.clip(x1, 0, width - 1))
+    x2 = float(np.clip(x2, 0, width - 1))
+    y1 = float(np.clip(y1, 0, height - 1))
+    y2 = float(np.clip(y2, 0, height - 1))
 
     roi = bbox_to_roi(BBox(x1, y1, x2, y2))
     roi.w *= margin
@@ -98,33 +167,14 @@ def _gaussian_heatmap(height: int, width: int, cx: float, cy: float, sigma: floa
     return torch.from_numpy(heatmap)
 
 
-def _crop_and_resize(
-    image: torch.Tensor,
-    heatmaps: torch.Tensor,
-    roi: ROI,
-    crop_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    _, height, width = image.shape
-    bbox = roi_to_bbox(roi)
-    x1 = int(max(0, np.floor(bbox.x1)))
-    y1 = int(max(0, np.floor(bbox.y1)))
-    x2 = int(min(width, np.ceil(bbox.x2)))
-    y2 = int(min(height, np.ceil(bbox.y2)))
-    if x2 <= x1:
-        x2 = min(width, x1 + 1)
-    if y2 <= y1:
-        y2 = min(height, y1 + 1)
-
-    image = image[:, y1:y2, x1:x2]
-    heatmaps = heatmaps[:, y1:y2, x1:x2]
-    size = (crop_size, crop_size)
-    image = F.interpolate(
-        image.unsqueeze(0), size=size, mode="bilinear", align_corners=False
-    ).squeeze(0)
-    heatmaps = F.interpolate(
-        heatmaps.unsqueeze(0), size=size, mode="bilinear", align_corners=False
-    ).squeeze(0)
-    return image, heatmaps
+def _jitter_roi(roi: ROI, shift: float = 0.1, scale: float = 0.15) -> ROI:
+    """Random shift and scale, so training crops look like crops from a predicted ROI."""
+    if roi.w <= 0 or roi.h <= 0:
+        return roi
+    # torch's RNG is seeded per DataLoader worker, unlike numpy's global one.
+    r = (torch.rand(3) * 2.0 - 1.0).tolist()
+    factor = 1.0 + scale * r[2]
+    return ROI(roi.cx + shift * roi.w * r[0], roi.cy + shift * roi.h * r[1], roi.w * factor, roi.h * factor)
 
 
 class ImagePoseDataset(Dataset):
@@ -183,44 +233,67 @@ class ImageKPHeatmapDataset(Dataset):
         mesh: trimesh.Trimesh,
         keypoints: list[CanonicalKeypoint],
         margin: float = 1.4,
+        heatmap_sigma: float = 2.0,
     ):
         self.df = data
         self.mesh = mesh
         self.margin = margin
         self.keypoints = keypoints
+        self.heatmap_sigma = heatmap_sigma
         self.transform = T.Compose([T.ToTensor()])
+        self.visibility = self._compute_visibility()
+
+    def _keypoint_positions(self) -> np.ndarray:
+        return np.stack([kp.position for kp in self.keypoints], axis=0).astype(np.float32)
+
+    def _compute_visibility(self) -> np.ndarray:
+        """Per-sample, per-keypoint visibility (in front, facing, unoccluded, projectable)."""
+        points = self._keypoint_positions()
+        normals = face_normals_at_points(self.mesh, points)
+        occluder = MeshOccluder(self.mesh)
+        visibility = np.zeros((len(self.df), len(points)), dtype=bool)
+        rows = zip(self.df["pose"], self.df["distortion_coeffs"])
+        for i, (pose, dist_coeffs) in enumerate(
+            tqdm(rows, total=len(self.df), desc="Keypoint visibility", unit="sample")
+        ):
+            visibility[i] = keypoint_visibility(
+                self.mesh, points, pose, occluder=occluder, normals=normals
+            ) & projectable_mask(points, pose, dist_coeffs)
+        logger.info(
+            "Keypoints visible in %.1f%% of sample/keypoint pairs (before image bounds).",
+            100.0 * visibility.mean() if visibility.size else 0.0,
+        )
+        return visibility
 
     def _load_image(self, row) -> torch.Tensor:
         image = Image.open(row["image"]).convert("RGB")
         return self.transform(image)
 
-    def _build_kp_heatmaps(self, row, image: torch.Tensor) -> torch.Tensor:
-        height, width = image.shape[-2:]
-        pose = row["pose"]
-        points = np.stack([kp.position for kp in self.keypoints], axis=0).astype(np.float32)
+    def _build_kp_heatmaps(self, idx: int, row, box: Box, out_size: tuple[int, int]) -> torch.Tensor:
+        """
+        Gaussian targets at heatmap resolution (sigma in heatmap cells) for the keypoints
+        that are visible and inside ``box`` once it is resized to ``out_size`` (width, height).
+        """
+        out_w, out_h = out_size
+        height = -(-out_h // HEATMAP_STRIDE)
+        width = -(-out_w // HEATMAP_STRIDE)
         image_points = project_points(
-            points,
-            pose,
+            self._keypoint_positions(),
+            row["pose"],
             row["camera_intrinsics"],
             row["distortion_coeffs"],
         )
-
-        visible = keypoint_visibility(self.mesh, points, pose)
-        in_bounds = (
-            (image_points[:, 0] >= 0) & (image_points[:, 0] < width) &
-            (image_points[:, 1] >= 0) & (image_points[:, 1] < height)
+        cells = image_to_crop(image_points, box, out_size, stride=HEATMAP_STRIDE)
+        inside = (
+            (cells[:, 0] >= -0.5) & (cells[:, 0] <= width - 0.5) &
+            (cells[:, 1] >= -0.5) & (cells[:, 1] <= height - 0.5)
         )
-        visible &= in_bounds
 
-        heatmaps = []
-        for i, _ in enumerate(self.keypoints):
-            if visible[i]:
-                x, y = image_points[i]
-                heatmaps.append(_gaussian_heatmap(height, width, float(x), float(y)))
-            else:
-                heatmaps.append(torch.zeros(height, width, dtype=image.dtype))
-
-        return torch.stack(heatmaps)
+        heatmaps = torch.zeros(len(self.keypoints), height, width)
+        for i in np.flatnonzero(self.visibility[idx] & inside):
+            x, y = cells[i]
+            heatmaps[i] = _gaussian_heatmap(height, width, float(x), float(y), self.heatmap_sigma)
+        return heatmaps
 
     def __len__(self):
         return len(self.df)
@@ -228,7 +301,8 @@ class ImageKPHeatmapDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         image = self._load_image(row)
-        heatmaps = self._build_kp_heatmaps(row, image)
+        height, width = image.shape[-2:]
+        heatmaps = self._build_kp_heatmaps(idx, row, (0, 0, width, height), (width, height))
         return image, heatmaps
 
 
@@ -240,14 +314,27 @@ class ImageKPHeatmapROIDataset(ImageKPHeatmapDataset):
         keypoints: list[CanonicalKeypoint],
         crop_size: int = 256,
         margin: float = 1.4,
+        heatmap_sigma: float = 2.0,
+        augment: bool = False,
     ):
-        super().__init__(data, mesh, keypoints, margin=margin)
+        super().__init__(data, mesh, keypoints, margin=margin, heatmap_sigma=heatmap_sigma)
         self.crop_size = crop_size
+        self.augment = augment
+        self.photometric = T.Compose([
+            T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.02),
+            T.RandomApply([T.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5))], p=0.3),
+        ])
+
+    def with_augmentation(self, augment: bool) -> "ImageKPHeatmapROIDataset":
+        """Shallow copy sharing the loaded data, with ROI jitter and colour/blur augmentation on or off."""
+        dataset = copy.copy(self)
+        dataset.augment = augment
+        return dataset
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         image = self._load_image(row)
-        heatmaps = self._build_kp_heatmaps(row, image)
+        height, width = image.shape[-2:]
 
         roi = _get_2d_roi(
             image.shape,
@@ -257,8 +344,14 @@ class ImageKPHeatmapROIDataset(ImageKPHeatmapDataset):
             row["distortion_coeffs"],
             self.margin,
         )
-        image, heatmaps = _crop_and_resize(image, heatmaps, roi, self.crop_size)
-        return image, heatmaps
+        if self.augment:
+            roi = _jitter_roi(roi)
+        box = crop_box(roi, height, width)
+        crop = crop_and_resize(image, box, self.crop_size)
+        if self.augment:
+            crop = self.photometric(crop)
+        heatmaps = self._build_kp_heatmaps(idx, row, box, (self.crop_size, self.crop_size))
+        return crop, heatmaps
 
 
 class DataLoader:
@@ -343,6 +436,7 @@ class DataLoader:
 
                 sample = {
                     "id": len(rows),
+                    "recording": directory.name,
                     "pose": pose,
                     "camera_intrinsics": camera_intrinsics,
                     "distortion_coeffs": distortion_coeffs,
@@ -369,6 +463,14 @@ class DataLoader:
             self.path,
         )
         return pd.DataFrame(rows)
+
+    def split_by_recording(
+        self,
+        val_fraction: float = DEFAULT_VAL_FRACTION,
+        test_fraction: float = DEFAULT_TEST_FRACTION,
+        seed: int = DEFAULT_SPLIT_SEED,
+    ) -> "RecordingSplit":
+        return split_by_recording(self.data, val_fraction, test_fraction, seed)
 
     def get_pose_dataset(self):
         if "image_undistorted" not in self.data.columns:
