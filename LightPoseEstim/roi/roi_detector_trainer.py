@@ -24,6 +24,7 @@ class ROIDetectorTrainer:
                  device: torch.device | None = None,
                  use_tensorboard: bool = False,
                  tensorboard_log_dir: str = "runs/roi_detector",
+                 augment: bool = True,
                  ):
 
         self.device = (
@@ -37,8 +38,9 @@ class ROIDetectorTrainer:
         # Build DataLoaders
         if split is None:
             split = split_by_recording(dataset.df)
-        train_dataset = Subset(dataset, split.indices(dataset.df, "train"))
-        val_dataset = Subset(dataset, split.indices(dataset.df, "val"))
+        # Augment training images only; validation measures clean images.
+        train_dataset = Subset(dataset.with_augmentation(augment), split.indices(dataset.df, "train"))
+        val_dataset = Subset(dataset.with_augmentation(False), split.indices(dataset.df, "val"))
         loader_kwargs = dict(
             batch_size=batch_size,
             num_workers=num_workers,
@@ -123,7 +125,13 @@ class ROIDetectorTrainer:
         epochs: int,
         save_path: str | Path | None = None,
         freeze_backbone: bool = False,
+        patience: int | None = None,
     ):
+        """
+        Train for up to ``epochs`` with a cosine learning-rate decay, keeping the
+        checkpoint with the best validation loss. With ``patience``, stop once the
+        validation loss has not improved for that many epochs.
+        """
         frozen = False
         unfrozen = False
         if freeze_backbone and hasattr(self.model, "freeze_backbone"):
@@ -141,12 +149,15 @@ class ROIDetectorTrainer:
         best_val_loss = float("inf")
         best_epoch = -1
         checkpoint_path = Path(save_path) if save_path is not None else None
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=epochs)
 
         try:
             pbar = tqdm(range(epochs), unit="epoch")
             for epoch in pbar:
                 train_loss = self.training_epoch(pbar)
                 val_loss = self.validation_epoch(pbar)
+                learning_rate = scheduler.get_last_lr()[0]
+                scheduler.step()
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_epoch = epoch
@@ -169,6 +180,14 @@ class ROIDetectorTrainer:
                 if writer is not None:
                     writer.add_scalar("loss/train", train_loss, epoch)
                     writer.add_scalar("loss/val", val_loss, epoch)
+                    writer.add_scalar("lr", learning_rate, epoch)
+                if patience is not None and epoch - best_epoch >= patience:
+                    logging.info(
+                        "Stopping at epoch %d: no val improvement for %d epochs",
+                        epoch,
+                        patience,
+                    )
+                    break
         finally:
             if writer is not None:
                 writer.close()

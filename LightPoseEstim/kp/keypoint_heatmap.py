@@ -17,7 +17,10 @@ _IMAGENET_STD = (0.229, 0.224, 0.225)
 class KeypointHeatmapNet(nn.Module):
     """
     MobileNetV3-small backbone with a small feature-pyramid decoder.
-    Outputs one heatmap of logits per keypoint at 1/HEATMAP_STRIDE of the input resolution.
+    Outputs one heatmap of logits per keypoint at 1/HEATMAP_STRIDE of the input resolution,
+    and a coarse object rotation from the whole crop. Keypoint heatmaps rely on local
+    appearance, so on a near-symmetric object they can swap sides; the global rotation
+    picks between a PnP pose and its symmetric twins.
     """
 
     def __init__(
@@ -47,6 +50,16 @@ class KeypointHeatmapNet(nn.Module):
             nn.Conv2d(decoder_channels, num_keypoints, kernel_size=1),
         )
         nn.init.constant_(self.head[-1].bias, _HEATMAP_PRIOR_BIAS)
+        # Keeps a coarse 4x4 layout: where parts sit in the crop is what gives orientation away.
+        self.orientation = nn.Sequential(
+            nn.Conv2d(tap_channels[-1], 32, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(4),
+            nn.Flatten(),
+            nn.Linear(32 * 4 * 4, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 6),
+        )
 
         self.__backbone_frozen = False
 
@@ -79,10 +92,11 @@ class KeypointHeatmapNet(nn.Module):
         print(f"Loaded keypoint heatmap net from {path} to {device}")
         return model.to(device).eval()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         :param x: image batch [B, 3, H, W] with values in [0, 1]
-        :return: heatmap logits [B, K, ceil(H / stride), ceil(W / stride)]
+        :return: heatmap logits [B, K, ceil(H / stride), ceil(W / stride)] and the
+            allocentric object rotation as 6 numbers [B, 6] (see rotation_from_6d)
         """
         x = (x - self.mean) / self.std
         features = []
@@ -98,19 +112,22 @@ class KeypointHeatmapNet(nn.Module):
         for lateral, feature in zip(reversed(self.lateral[:-1]), reversed(features[:-1])):
             y = F.interpolate(y, size=feature.shape[-2:], mode="bilinear", align_corners=False)
             y = y + lateral(feature)
-        return self.head(y)
+        return self.head(y), self.orientation(features[-1])
 
     @torch.no_grad()
     def inference(
         self,
         x: torch.Tensor,
         threshold: float = DEFAULT_PEAK_THRESHOLD,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         :param x: input image batch [B, 3, H, W]
-        :return: peak coordinates [B, K, 2] in heatmap cells (x, y) and confidences [B, K]
+        :return: peak coordinates [B, K, 2] in heatmap cells (x, y), confidences [B, K],
+            and allocentric rotation matrices [B, 3, 3]
         """
-        return heatmap_peaks(self.forward(x).sigmoid(), threshold=threshold)
+        logits, rotation = self.forward(x)
+        coordinates, confidence = heatmap_peaks(logits.sigmoid(), threshold=threshold)
+        return coordinates, confidence, rotation_from_6d(rotation)
 
     def freeze_backbone(self):
         for param in self.feature_extractor.parameters():
@@ -146,6 +163,33 @@ class HeatmapFocalLoss(nn.Module):
         weight = (target - logits.sigmoid()).abs().pow(self.gamma)
         num_peaks = (target.flatten(2).amax(dim=2) > 0).sum().clamp_min(1)
         return (weight * bce).sum() / num_peaks
+
+
+class KeypointLoss(nn.Module):
+    """Heatmap focal loss plus squared Frobenius distance between predicted and true rotation."""
+
+    def __init__(self, rotation_weight: float = 1.0):
+        super().__init__()
+        self.heatmap = HeatmapFocalLoss()
+        self.rotation_weight = rotation_weight
+
+    def forward(
+        self,
+        outputs: tuple[torch.Tensor, torch.Tensor],
+        targets: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        logits, rotation = outputs
+        heatmaps, rotation_target = targets
+        rotation_error = (rotation_from_6d(rotation) - rotation_target).pow(2).sum(dim=(1, 2)).mean()
+        return self.heatmap(logits, heatmaps) + self.rotation_weight * rotation_error
+
+
+def rotation_from_6d(x: torch.Tensor) -> torch.Tensor:
+    """[B, 6] (first two matrix columns, unnormalized) -> rotation matrices [B, 3, 3] by Gram-Schmidt."""
+    a, b = x[:, :3], x[:, 3:]
+    first = F.normalize(a, dim=1)
+    second = F.normalize(b - (first * b).sum(dim=1, keepdim=True) * first, dim=1)
+    return torch.stack([first, second, torch.linalg.cross(first, second)], dim=2)
 
 
 @torch.no_grad()

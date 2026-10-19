@@ -8,7 +8,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from ..dataloader import ImageKPHeatmapROIDataset, RecordingSplit, split_by_recording
-from .keypoint_heatmap import HeatmapFocalLoss, KeypointHeatmapNet
+from .keypoint_heatmap import KeypointHeatmapNet, KeypointLoss
 
 
 class KeypointHeatmapTrainer:
@@ -19,7 +19,7 @@ class KeypointHeatmapTrainer:
         split: RecordingSplit | None = None,
         batch_size: int = 32,
         num_workers: int = 0,
-        criterion: nn.Module = HeatmapFocalLoss(),
+        criterion: nn.Module = KeypointLoss(),
         optimizer_cls: type[torch.optim.Optimizer] = torch.optim.Adam,
         optimizer_kwargs: dict | None = None,
         device: torch.device | None = None,
@@ -74,12 +74,12 @@ class KeypointHeatmapTrainer:
         self.model.train()
         total_loss = 0.0
         num_batches = len(self.train_loader)
-        for batch_idx, (images, heatmaps) in enumerate(self.train_loader):
+        for batch_idx, (images, *targets) in enumerate(self.train_loader):
             images = images.to(self.device, non_blocking=self.pin_memory)
-            heatmaps = heatmaps.to(self.device, non_blocking=self.pin_memory)
+            targets = [t.to(self.device, non_blocking=self.pin_memory) for t in targets]
 
             predictions = self.model(images)
-            loss = self.criterion(predictions, heatmaps)
+            loss = self.criterion(predictions, targets)
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -101,12 +101,12 @@ class KeypointHeatmapTrainer:
         total_loss = 0.0
         num_batches = len(self.val_loader)
 
-        for batch_idx, (images, heatmaps) in enumerate(self.val_loader):
+        for batch_idx, (images, *targets) in enumerate(self.val_loader):
             images = images.to(self.device, non_blocking=self.pin_memory)
-            heatmaps = heatmaps.to(self.device, non_blocking=self.pin_memory)
+            targets = [t.to(self.device, non_blocking=self.pin_memory) for t in targets]
 
             predictions = self.model(images)
-            loss = self.criterion(predictions, heatmaps)
+            loss = self.criterion(predictions, targets)
 
             total_loss += loss.item()
             pbar.set_postfix(
@@ -124,7 +124,13 @@ class KeypointHeatmapTrainer:
         epochs: int,
         save_path: str | Path | None = None,
         freeze_backbone: bool = False,
+        patience: int | None = None,
     ):
+        """
+        Train for up to ``epochs`` with a cosine learning-rate decay, keeping the
+        checkpoint with the best validation loss. With ``patience``, stop once the
+        validation loss has not improved for that many epochs.
+        """
         frozen = False
         unfrozen = False
         if freeze_backbone and hasattr(self.model, "freeze_backbone"):
@@ -142,12 +148,15 @@ class KeypointHeatmapTrainer:
         best_val_loss = float("inf")
         best_epoch = -1
         checkpoint_path = Path(save_path) if save_path is not None else None
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=epochs)
 
         try:
             pbar = tqdm(range(epochs), unit="epoch")
             for epoch in pbar:
                 train_loss = self.training_epoch(pbar)
                 val_loss = self.validation_epoch(pbar)
+                learning_rate = scheduler.get_last_lr()[0]
+                scheduler.step()
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_epoch = epoch
@@ -170,6 +179,14 @@ class KeypointHeatmapTrainer:
                 if writer is not None:
                     writer.add_scalar("loss/train", train_loss, epoch)
                     writer.add_scalar("loss/val", val_loss, epoch)
+                    writer.add_scalar("lr", learning_rate, epoch)
+                if patience is not None and epoch - best_epoch >= patience:
+                    logging.info(
+                        "Stopping at epoch %d: no val improvement for %d epochs",
+                        epoch,
+                        patience,
+                    )
+                    break
         finally:
             if writer is not None:
                 writer.close()

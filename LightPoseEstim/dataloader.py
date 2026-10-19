@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as T
 import trimesh
 from PIL import Image
@@ -18,6 +19,7 @@ from .crop import HEATMAP_STRIDE, Box, crop_and_resize, crop_box, image_to_crop
 from .pose import Pose
 from .projection import (
     MeshOccluder,
+    allocentric_rotation,
     camera_frame_points,
     face_normals_at_points,
     keypoint_visibility,
@@ -26,6 +28,7 @@ from .projection import (
     projectable_mask,
 )
 from .roi import BBox, ROI, bbox_to_roi, normalize_roi
+from .roi.roi_detector import resize_for_roi
 from .keypoint_selector import CanonicalKeypoint
 
 logger = logging.getLogger(__name__)
@@ -167,8 +170,19 @@ def _gaussian_heatmap(height: int, width: int, cx: float, cy: float, sigma: floa
     return torch.from_numpy(heatmap)
 
 
-def _jitter_roi(roi: ROI, shift: float = 0.1, scale: float = 0.15) -> ROI:
-    """Random shift and scale, so training crops look like crops from a predicted ROI."""
+def _photometric_augmentation() -> T.Compose:
+    return T.Compose([
+        T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.02),
+        T.RandomApply([T.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5))], p=0.3),
+    ])
+
+
+def _jitter_roi(roi: ROI, shift: float = 0.2, scale: float = 0.25) -> ROI:
+    """
+    Random shift and scale, so training crops look like crops from a predicted ROI.
+    The defaults cover the ROI detector's measured validation errors (centre off by up to
+    ~0.23 of the box size and size off by ~20% at the 90th percentile).
+    """
     if roi.w <= 0 or roi.h <= 0:
         return roi
     # torch's RNG is seeded per DataLoader worker, unlike numpy's global one.
@@ -193,11 +207,21 @@ class ImagePoseDataset(Dataset):
 
 
 class ImageROIDataset(Dataset):
-    def __init__(self, data: pd.DataFrame, mesh: trimesh.Trimesh, margin: float = 1.4):
+    """Images resized to ROI_INPUT_SIZE with normalized (cx, cy, w, h) box targets."""
+
+    def __init__(self, data: pd.DataFrame, mesh: trimesh.Trimesh, margin: float = 1.4, augment: bool = False):
         self.df = data
         self.mesh = mesh
         self.margin = margin
+        self.augment = augment
         self.transform = T.Compose([T.ToTensor()])
+        self.photometric = _photometric_augmentation()
+
+    def with_augmentation(self, augment: bool) -> "ImageROIDataset":
+        """Shallow copy sharing the loaded data, with zoom/flip/colour augmentation on or off."""
+        dataset = copy.copy(self)
+        dataset.augment = augment
+        return dataset
 
     def __len__(self):
         return len(self.df)
@@ -215,15 +239,40 @@ class ImageROIDataset(Dataset):
             row["distortion_coeffs"],
             self.margin,
         )
-
-        return image, normalize_roi(
+        target = normalize_roi(
             image.unsqueeze(0),
-            torch.tensor(
-                [roi.cx, roi.cy, roi.w, roi.h],
-                dtype=image.dtype,
-                device=image.device,
-            ),
+            torch.tensor([roi.cx, roi.cy, roi.w, roi.h], dtype=image.dtype),
         )
+        image = resize_for_roi(image)
+        if self.augment:
+            image, target = self._augment(image, target)
+        return image, target
+
+    def _augment(self, image: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # torch's RNG is seeded per DataLoader worker, unlike numpy's global one.
+        cx, cy, w, h = target.tolist()
+        _, height, width = image.shape
+        if w > 0 and h > 0:
+            # Zoom into a random window (75-100% of the image) that still holds the whole box.
+            scale = 1.0 - 0.25 * float(torch.rand(()))
+            crop_w, crop_h = round(scale * width), round(scale * height)
+            x_lo, x_hi = max(0.0, cx + w / 2 - crop_w / width), min(cx - w / 2, 1.0 - crop_w / width)
+            y_lo, y_hi = max(0.0, cy + h / 2 - crop_h / height), min(cy - h / 2, 1.0 - crop_h / height)
+            if x_lo <= x_hi and y_lo <= y_hi:
+                x0 = round((x_lo + (x_hi - x_lo) * float(torch.rand(()))) * width)
+                y0 = round((y_lo + (y_hi - y_lo) * float(torch.rand(()))) * height)
+                image = F.interpolate(
+                    image[:, y0:y0 + crop_h, x0:x0 + crop_w].unsqueeze(0),
+                    size=(height, width),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+                cx, w = (cx - x0 / width) * width / crop_w, w * width / crop_w
+                cy, h = (cy - y0 / height) * height / crop_h, h * height / crop_h
+            if float(torch.rand(())) < 0.5:
+                image = image.flip(-1)
+                cx = 1.0 - cx
+        return self.photometric(image), torch.tensor([cx, cy, w, h], dtype=image.dtype)
 
 
 class ImageKPHeatmapDataset(Dataset):
@@ -303,7 +352,11 @@ class ImageKPHeatmapDataset(Dataset):
         image = self._load_image(row)
         height, width = image.shape[-2:]
         heatmaps = self._build_kp_heatmaps(idx, row, (0, 0, width, height), (width, height))
-        return image, heatmaps
+        return image, heatmaps, self._rotation_target(row)
+
+    @staticmethod
+    def _rotation_target(row) -> torch.Tensor:
+        return torch.from_numpy(allocentric_rotation(row["pose"]).astype(np.float32))
 
 
 class ImageKPHeatmapROIDataset(ImageKPHeatmapDataset):
@@ -320,10 +373,7 @@ class ImageKPHeatmapROIDataset(ImageKPHeatmapDataset):
         super().__init__(data, mesh, keypoints, margin=margin, heatmap_sigma=heatmap_sigma)
         self.crop_size = crop_size
         self.augment = augment
-        self.photometric = T.Compose([
-            T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.02),
-            T.RandomApply([T.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5))], p=0.3),
-        ])
+        self.photometric = _photometric_augmentation()
 
     def with_augmentation(self, augment: bool) -> "ImageKPHeatmapROIDataset":
         """Shallow copy sharing the loaded data, with ROI jitter and colour/blur augmentation on or off."""
@@ -351,7 +401,7 @@ class ImageKPHeatmapROIDataset(ImageKPHeatmapDataset):
         if self.augment:
             crop = self.photometric(crop)
         heatmaps = self._build_kp_heatmaps(idx, row, box, (self.crop_size, self.crop_size))
-        return crop, heatmaps
+        return crop, heatmaps, self._rotation_target(row)
 
 
 class DataLoader:

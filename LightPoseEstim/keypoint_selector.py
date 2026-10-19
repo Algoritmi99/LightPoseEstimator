@@ -345,15 +345,15 @@ class MeshKeypointSelector:
 
         with self._quiet_trimesh_logs():
             try:
-                points, face_idx = trimesh.sample.sample_surface_even(mesh, sample_count)
+                points, face_idx = trimesh.sample.sample_surface_even(mesh, sample_count, seed=self.rng)
             except BaseException:
-                points, face_idx = trimesh.sample.sample_surface(mesh, sample_count)
+                points, face_idx = trimesh.sample.sample_surface(mesh, sample_count, seed=self.rng)
 
             # If even sampling cannot place enough separated points, top up with
             # regular surface sampling so downstream always sees the target count.
             missing = sample_count - int(points.shape[0])
             if missing > 0:
-                extra_points, extra_faces = trimesh.sample.sample_surface(mesh, missing)
+                extra_points, extra_faces = trimesh.sample.sample_surface(mesh, missing, seed=self.rng)
                 points = np.vstack([points, extra_points])
                 face_idx = np.concatenate([face_idx, extra_faces], axis=0)
 

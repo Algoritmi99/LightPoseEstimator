@@ -70,11 +70,17 @@ keypoint_heatmap_20/
 
 ## Train and evaluate the full pipeline
 
-`train.py` runs both ROI stages and both keypoint stages into one run directory:
+`train.py` trains the ROI detector, selects keypoints and trains the keypoint net into one
+run directory. This is the recommended way to train; the per-stage scripts above still use the
+older frozen-backbone schedule.
 
 ```bash
-python train.py --dataset data/Astrobee --epochs 20
+python train.py --dataset data/Astrobee --epochs 30
 ```
+
+Each network trains in one stage with the whole model unfrozen, at `--lr` (default 1e-3)
+decaying to 0 over `--epochs`, and stops early after `--patience` epochs without a better
+validation loss. `--seed` fixes keypoint selection and initialisation, so runs are comparable.
 
 Data is split by recording, not by frame, so near-identical neighbouring frames never land
 in both training and validation. By default 70% of recordings train, 15% validate (checkpoint

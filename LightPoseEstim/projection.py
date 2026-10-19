@@ -44,6 +44,26 @@ def max_valid_radius(dist_coeffs: np.ndarray | None) -> float:
     return _max_valid_radius(coeffs)
 
 
+def ray_rotation(translation: np.ndarray) -> np.ndarray:
+    """Smallest rotation turning the camera's optical axis (+z) onto the ray to ``translation``."""
+    ray = np.asarray(translation, dtype=np.float64).reshape(3)
+    ray = ray / np.linalg.norm(ray)
+    axis = np.cross([0.0, 0.0, 1.0], ray)
+    sin_angle = np.linalg.norm(axis)
+    if sin_angle < 1e-12:
+        return np.eye(3)
+    rotvec = axis / sin_angle * np.arctan2(sin_angle, ray[2])
+    return cv2.Rodrigues(rotvec)[0]
+
+
+def allocentric_rotation(pose: Pose) -> np.ndarray:
+    """
+    Object rotation as seen along the viewing ray (what a crop shows), rather than
+    relative to the optical axis. Inverse: ``ray_rotation(t) @ allocentric``.
+    """
+    return ray_rotation(pose.get_tvec()).T @ pose.quaternion.to_rotation_matrix()
+
+
 def camera_frame_points(points: np.ndarray, pose: Pose) -> np.ndarray:
     rot_matrix, _ = cv2.Rodrigues(pose.get_rvec())
     return (rot_matrix @ np.asarray(points).T + pose.get_tvec().reshape(3, 1)).T

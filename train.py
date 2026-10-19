@@ -3,12 +3,12 @@ import json
 import logging
 from pathlib import Path
 
+import torch
+
 from LightPoseEstim import (
     DataLoader,
-    KeypointHeatmapNet,
     KeypointHeatmapTrainer,
     MeshKeypointSelector,
-    ROIDetector,
     ROIDetectorTrainer,
     save_canonical_keypoints,
 )
@@ -22,7 +22,6 @@ from LightPoseEstim.pose_estimator import ROI_CHECKPOINT_RELATIVE, RUN_CONFIG_RE
 
 DEFAULT_DATASET = Path(__file__).resolve().parent / "data" / "Astrobee"
 DEFAULT_OUTPUT = Path("pose_estimator")
-FINE_TUNE_LR = 1e-5
 
 
 def parse_args():
@@ -42,7 +41,25 @@ def parse_args():
         action="store_true",
         help="Do not translate mesh so its bbox center is at the origin.",
     )
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=30,
+        help="Maximum epochs for each network; the learning rate decays to 0 over them.",
+    )
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=8,
+        help="Stop a network's training after this many epochs without a better val loss.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Seed for keypoint selection and network initialisation.",
+    )
     parser.add_argument(
         "--val-fraction",
         type=float,
@@ -60,7 +77,7 @@ def parse_args():
         "--roi-batch-size",
         type=int,
         default=64,
-        help="ROI batch size. 64 uses about 24 GB on 1280x960 images.",
+        help="ROI batch size. Images are downscaled to 320x240, so 64 needs little memory.",
     )
     parser.add_argument(
         "--kp-batch-size",
@@ -80,7 +97,7 @@ def parse_args():
         default=DEFAULT_OUTPUT,
         help=(
             "Run directory base path. Training writes {stem}_{epochs}/ with the "
-            "fine-tuned ROI detector, keypoint net, canonical keypoints, and config."
+            "ROI detector, keypoint net, canonical keypoints, and config."
         ),
     )
     parser.add_argument(
@@ -105,19 +122,10 @@ def main():
         recenter_mesh=not args.no_recenter_mesh,
     )
     run_dir = run_directory(args.output, args.epochs)
-    stage0_dir = run_dir / "stage0"
-    roi_stage0_path = stage0_dir / "roi_detector.pth"
     roi_path = run_dir / ROI_CHECKPOINT_RELATIVE
-    keypoint_stage0_path = stage0_dir / "keypoint_heatmap.pth"
     keypoint_net_path = run_dir / NET_SUBDIR / "keypoint_heatmap.pth"
     keypoints_path = run_dir / KEYPOINTS_SUBDIR / KEYPOINTS_FILENAME
-    for path in (
-        roi_stage0_path,
-        roi_path,
-        keypoint_stage0_path,
-        keypoint_net_path,
-        keypoints_path,
-    ):
+    for path in (roi_path, keypoint_net_path, keypoints_path):
         path.parent.mkdir(parents=True, exist_ok=True)
 
     split = loader.split_by_recording(
@@ -135,52 +143,31 @@ def main():
     use_tensorboard = not args.no_tensorboard
     log_root = Path("runs") / run_dir.name
 
-    roi_dataset = loader.get_roi_dataset(margin=args.margin)
+    # One stage per network, whole model trained from the start: in tests this beat a
+    # frozen-backbone stage followed by a low-learning-rate fine-tune.
+    torch.manual_seed(args.seed)
     logging.info(
-        "ROI stage 0: training for %d epochs (freeze_backbone=True, batch_size=%d, workers=%d)",
+        "ROI detector: up to %d epochs (lr=%s, patience=%d, batch_size=%d, workers=%d)",
         args.epochs,
+        args.lr,
+        args.patience,
         args.roi_batch_size,
         args.workers,
     )
-    logging.info("Saving ROI stage-0 checkpoint to %s", roi_stage0_path)
     ROIDetectorTrainer(
-        roi_dataset,
+        loader.get_roi_dataset(margin=args.margin),
         batch_size=args.roi_batch_size,
         num_workers=args.workers,
         split=split,
+        optimizer_kwargs=dict(lr=args.lr),
         use_tensorboard=use_tensorboard,
         tensorboard_log_dir=str(log_root / "roi"),
-    ).train(
-        args.epochs,
-        save_path=str(roi_stage0_path),
-        freeze_backbone=True,
-    )
-
-    logging.info(
-        "ROI stage 1: fine-tuning for %d epochs from %s (freeze_backbone=False, lr=%s)",
-        args.epochs,
-        roi_stage0_path,
-        FINE_TUNE_LR,
-    )
-    logging.info("Saving ROI checkpoint to %s", roi_path)
-    ROIDetectorTrainer(
-        roi_dataset,
-        model=ROIDetector.load(roi_stage0_path),
-        batch_size=args.roi_batch_size,
-        num_workers=args.workers,
-        split=split,
-        use_tensorboard=use_tensorboard,
-        tensorboard_log_dir=str(log_root / "roi_finetune"),
-        optimizer_kwargs=dict(lr=FINE_TUNE_LR),
-    ).train(
-        args.epochs,
-        save_path=str(roi_path),
-        freeze_backbone=False,
-    )
+    ).train(args.epochs, save_path=str(roi_path), patience=args.patience)
 
     logging.info("Selecting canonical keypoints from the mesh")
     keypoints = MeshKeypointSelector(
         final_keypoint_count=args.keypoint_count,
+        random_seed=args.seed,
     ).select_keypoints(loader.mesh, keypoint_count=args.keypoint_count)
     save_canonical_keypoints(keypoints_path, keypoints)
     logging.info("Loading dataset with images, ROI, and keypoint heatmaps")
@@ -191,49 +178,22 @@ def main():
     )
 
     logging.info(
-        "Keypoint stage 0: training for %d epochs (freeze_backbone=True, batch_size=%d, workers=%d)",
+        "Keypoint net: up to %d epochs (lr=%s, patience=%d, batch_size=%d, workers=%d)",
         args.epochs,
+        args.lr,
+        args.patience,
         args.kp_batch_size,
         args.workers,
     )
-    logging.info("Saving keypoint stage-0 checkpoint to %s", keypoint_stage0_path)
     KeypointHeatmapTrainer(
         kp_dataset,
         batch_size=args.kp_batch_size,
         num_workers=args.workers,
         split=split,
+        optimizer_kwargs=dict(lr=args.lr),
         use_tensorboard=use_tensorboard,
         tensorboard_log_dir=str(log_root / "keypoints"),
-    ).train(
-        args.epochs,
-        save_path=str(keypoint_stage0_path),
-        freeze_backbone=True,
-    )
-
-    logging.info(
-        "Keypoint stage 1: fine-tuning for %d epochs from %s (freeze_backbone=False, lr=%s)",
-        args.epochs,
-        keypoint_stage0_path,
-        FINE_TUNE_LR,
-    )
-    logging.info("Saving keypoint checkpoint to %s", keypoint_net_path)
-    KeypointHeatmapTrainer(
-        kp_dataset,
-        model=KeypointHeatmapNet.load(
-            keypoint_stage0_path,
-            num_keypoints=len(keypoints),
-        ),
-        batch_size=args.kp_batch_size,
-        num_workers=args.workers,
-        split=split,
-        use_tensorboard=use_tensorboard,
-        tensorboard_log_dir=str(log_root / "keypoints_finetune"),
-        optimizer_kwargs=dict(lr=FINE_TUNE_LR),
-    ).train(
-        args.epochs,
-        save_path=str(keypoint_net_path),
-        freeze_backbone=False,
-    )
+    ).train(args.epochs, save_path=str(keypoint_net_path), patience=args.patience)
 
     config_path = run_dir / RUN_CONFIG_RELATIVE
     config = {
@@ -241,6 +201,8 @@ def main():
         "margin": args.margin,
         "mesh_scale": args.mesh_scale,
         "recenter_mesh": not args.no_recenter_mesh,
+        "seed": args.seed,
+        "lr": args.lr,
         "split_seed": args.split_seed,
         "split": split.to_dict(),
     }

@@ -17,7 +17,7 @@ from .keypoint_selector import (
 from .crop import crop_and_resize, crop_box, crop_to_image
 from .kp.keypoint_heatmap import DEFAULT_PEAK_THRESHOLD, KeypointHeatmapNet
 from .pose import Pose
-from .projection import as_dist_coeffs, project_points, projectable_mask
+from .projection import as_dist_coeffs, project_points, projectable_mask, ray_rotation
 from .roi import ROI, roi_to_bbox
 from .roi.roi_detector import ROIDetector
 
@@ -29,6 +29,8 @@ _REPROJECTION_ERROR_CELLS = 2.0
 _MIN_REPROJECTION_ERROR_PX = 4.0
 # 4 points always fit some pose, so a 5th is needed to reject outliers at all.
 _MIN_PNP_INLIERS = 5
+# Identity and 180-degree turns about the object x, y and z axes.
+_SYMMETRY_TURNS = [np.diag(signs).astype(np.float64) for signs in ((1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1))]
 
 
 @dataclass
@@ -160,7 +162,7 @@ class PoseEstimator:
 
         box = crop_box(roi, height, width)
         crop = crop_and_resize(image, box, self.crop_size)
-        cells, confidence = self.keypoint_net.inference(
+        cells, confidence, rotation = self.keypoint_net.inference(
             crop.unsqueeze(0),
             threshold=self.peak_threshold,
         )
@@ -175,8 +177,10 @@ class PoseEstimator:
         cell_px = stride * max(box[2] - box[0], box[3] - box[1]) / self.crop_size
         max_error = max(_MIN_REPROJECTION_ERROR_PX, _REPROJECTION_ERROR_CELLS * cell_px)
         pose = self._solve_pose(image_points, confidence, max_error)
-        if pose is not None and self._pose_outside_fov(pose, height, width):
-            pose = None
+        if pose is not None:
+            pose = self._resolve_symmetry(pose, rotation[0].cpu().numpy())
+            if self._pose_outside_fov(pose, height, width):
+                pose = None
         return PoseEstimationResult(
             pose=pose,
             roi=roi,
@@ -219,6 +223,25 @@ class PoseEstimator:
             & (projected[:, 1] >= 0) & (projected[:, 1] < height)
         )
         return not bool(np.any(inside))
+
+    @staticmethod
+    def _resolve_symmetry(pose: Pose, allocentric: np.ndarray) -> Pose:
+        """
+        Keypoints on a near-symmetric object can land on the wrong side, which turns the
+        PnP pose 180 degrees about an object axis through the origin (the mesh bbox centre
+        when recentered). Of the PnP pose and those turned versions, keep the one closest
+        to the network's coarse whole-crop rotation.
+        """
+        tvec = pose.get_tvec()
+        coarse = ray_rotation(tvec) @ allocentric
+        rotation = pose.quaternion.to_rotation_matrix()
+        candidates = [rotation @ turn for turn in _SYMMETRY_TURNS]
+        best = int(np.argmax([np.trace(candidate.T @ coarse) for candidate in candidates]))
+        if best == 0:
+            return pose
+        qx, qy, qz, qw = Rotation.from_matrix(candidates[best]).as_quat()
+        t = tvec.reshape(3)
+        return Pose(float(t[0]), float(t[1]), float(t[2]), qx, qy, qz, qw)
 
     def _solve_pose(
         self,
