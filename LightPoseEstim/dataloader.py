@@ -1,6 +1,7 @@
 import copy
 import json
 import logging
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -12,6 +13,7 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 import trimesh
 from PIL import Image
+from scipy.spatial.transform import Rotation
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
@@ -23,12 +25,11 @@ from .projection import (
     camera_frame_points,
     face_normals_at_points,
     keypoint_visibility,
-    mesh_bbox_corners,
     project_points,
     projectable_mask,
 )
 from .roi import BBox, ROI, bbox_to_roi, normalize_roi
-from .roi.roi_detector import resize_for_roi
+from .roi.roi_detector import ROI_INPUT_SIZE, resize_for_roi
 from .keypoint_selector import CanonicalKeypoint
 
 logger = logging.getLogger(__name__)
@@ -121,18 +122,20 @@ def _get_2d_roi(
     margin: float = 1.2,
 ) -> ROI:
     height, width = img_shape[-2:]
-    bbox_3d = mesh_bbox_corners(mesh)
+    # The projected convex hull bounds the projected mesh exactly; the 3D bounding box
+    # is much looser on non-box shapes (about 2x the area on a satellite with a panel).
+    hull_points = np.asarray(mesh.convex_hull.vertices)
 
-    camera_points = camera_frame_points(bbox_3d, pose)
+    camera_points = camera_frame_points(hull_points, pose)
     in_front_mask = camera_points[:, 2] > 1e-6
     if int(np.sum(in_front_mask)) < 2:
         return ROI(0.0, 0.0, 0.0, 0.0)
 
-    projectable = projectable_mask(bbox_3d, pose, dist_coeffs)
+    projectable = projectable_mask(hull_points, pose, dist_coeffs)
     image_points = [np.empty((0, 2), dtype=np.float32)]
     if projectable.any():
         image_points.append(
-            project_points(bbox_3d[projectable], pose, camera_intrinsics, dist_coeffs)
+            project_points(hull_points[projectable], pose, camera_intrinsics, dist_coeffs)
         )
     # Corners past the distortion fold would be projected back into the image.
     # They lie outside it along their own direction, so push them past the edge.
@@ -207,12 +210,20 @@ class ImagePoseDataset(Dataset):
 
 
 class ImageROIDataset(Dataset):
-    """Images resized to ROI_INPUT_SIZE with normalized (cx, cy, w, h) box targets."""
+    """Images resized to ``input_size`` (width, height) with normalized (cx, cy, w, h) box targets."""
 
-    def __init__(self, data: pd.DataFrame, mesh: trimesh.Trimesh, margin: float = 1.4, augment: bool = False):
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        mesh: trimesh.Trimesh,
+        margin: float = 1.4,
+        augment: bool = False,
+        input_size: tuple[int, int] = ROI_INPUT_SIZE,
+    ):
         self.df = data
         self.mesh = mesh
         self.margin = margin
+        self.input_size = tuple(input_size)
         self.augment = augment
         self.transform = T.Compose([T.ToTensor()])
         self.photometric = _photometric_augmentation()
@@ -243,7 +254,7 @@ class ImageROIDataset(Dataset):
             image.unsqueeze(0),
             torch.tensor([roi.cx, roi.cy, roi.w, roi.h], dtype=image.dtype),
         )
-        image = resize_for_roi(image)
+        image = resize_for_roi(image, self.input_size)
         if self.augment:
             image, target = self._augment(image, target)
         return image, target
@@ -405,27 +416,45 @@ class ImageKPHeatmapROIDataset(ImageKPHeatmapDataset):
 
 
 class DataLoader:
-    def __init__(self, path: Path, mesh_scale: float = 1.0, recenter_mesh: bool = False):
-        """
-        Load a pose-estimation dataset from a directory.
+    """
+    Recordings layout (the Astrobee datasets):
+    - One mesh file at the dataset root, in mm, with the pose frame at its bbox centre.
+    - Per recording: one CSV (poses), one JSON (K, D), and a ``*imgs`` folder.
+      ``*imgs_undistorted`` is optional. When it is absent, ``image_undistorted`` is omitted.
 
-        Expected layout:
-        - One mesh file at the dataset root.
-        - Per recording: one CSV (poses), one JSON (K, D), and a ``*imgs`` folder.
-          ``*imgs_undistorted`` is optional. When it is absent, ``image_undistorted`` is omitted.
-        """
-        self.path = path
-        self.mesh_scale = mesh_scale
-        self.recenter_mesh = recenter_mesh
+    Subclasses read other layouts into the same ``data`` columns (id, recording, pose,
+    camera_intrinsics, distortion_coeffs, image), so every dataset and trainer works on them.
+    """
+
+    FORMAT = "recordings"
+    DEFAULT_MESH_SCALE = 0.001
+    DEFAULT_RECENTER_MESH = True
+
+    def __init__(self, path: Path, mesh_scale: float | None = None, recenter_mesh: bool | None = None):
+        """``None`` uses the layout's defaults (DEFAULT_MESH_SCALE, DEFAULT_RECENTER_MESH)."""
+        self.path = Path(path)
+        self.mesh_scale = self.DEFAULT_MESH_SCALE if mesh_scale is None else mesh_scale
+        self.recenter_mesh = self.DEFAULT_RECENTER_MESH if recenter_mesh is None else recenter_mesh
         self.data = self._load_data()
         self.mesh = self._load_mesh()
 
-    def _load_mesh(self):
+    def image_size(self) -> tuple[int, int]:
+        """(width, height) of the first image; all images of a dataset share one camera."""
+        with Image.open(self.data.iloc[0]["image"]) as image:
+            return image.size
+
+    def _find_mesh_file(self) -> Path:
         files = []
         for ext in trimesh.available_formats():
             files.extend(self.path.glob(f"*.{ext}"))
         assert len(files) == 1, f"Found {len(files)} mesh files in {self.path}; expected 1."
-        mesh = trimesh.load_mesh(files[0])
+        return files[0]
+
+    def _read_mesh(self, path: Path) -> trimesh.Trimesh:
+        return trimesh.load_mesh(path)
+
+    def _load_mesh(self):
+        mesh = self._read_mesh(self._find_mesh_file())
         if self.mesh_scale != 1.0:
             mesh.apply_scale(self.mesh_scale)
         if self.recenter_mesh:
@@ -527,8 +556,8 @@ class DataLoader:
             raise ValueError("Dataset has no undistorted images.")
         return ImagePoseDataset(self.data)
 
-    def get_roi_dataset(self, margin: float = 1.4):
-        return ImageROIDataset(self.data, self.mesh, margin=margin)
+    def get_roi_dataset(self, margin: float = 1.4, input_size: tuple[int, int] = ROI_INPUT_SIZE):
+        return ImageROIDataset(self.data, self.mesh, margin=margin, input_size=input_size)
 
     def get_kp_heatmap_dataset(self, keypoints: list[CanonicalKeypoint], margin: float = 1.4):
         return ImageKPHeatmapDataset(self.data, self.mesh, keypoints, margin=margin)
@@ -546,3 +575,120 @@ class DataLoader:
             crop_size=crop_size,
             margin=margin,
         )
+
+
+class EO1DataLoader(DataLoader):
+    """
+    Single-folder layout of independent renders (the Polimi EO-1 dataset):
+    - one glTF/GLB mesh at the root, in metres, with the pose frame at the model origin,
+    - ``camera_intrinsics.json`` with K (pinhole, no distortion),
+    - ``pose_labels.json`` with, per frame: timestamp k, class, visibility, translation
+      and rotation (``x_C = R_CT X_T + t``),
+    - ``dataset/main_camera_<k>.000.png``.
+
+    Frames are independent random poses, so for splitting they are grouped into blocks of
+    ``FRAMES_PER_BLOCK`` consecutive frames (stored as the ``recording`` column); that keeps
+    the saved split short without letting near-duplicates leak between splits.
+    """
+
+    FORMAT = "eo1"
+    DEFAULT_MESH_SCALE = 1.0
+    DEFAULT_RECENTER_MESH = False
+    LABELS_FILE = "pose_labels.json"
+    INTRINSICS_FILE = "camera_intrinsics.json"
+    IMAGE_DIR = "dataset"
+    FRAMES_PER_BLOCK = 50
+    # glTF stores meshes Y-up; the labels use the model's Z-up frame: (x, y, z) -> (x, -z, y).
+    # Checked against the renders: this axis map and the label quaternion convention below
+    # are the only combination whose projected silhouette matches the target (IoU 0.74, next 0.44).
+    GLTF_TO_MODEL_FRAME = np.array([
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+
+    @classmethod
+    def matches(cls, path: Path) -> bool:
+        path = Path(path)
+        return (path / cls.LABELS_FILE).is_file() and (path / cls.IMAGE_DIR).is_dir()
+
+    def _read_mesh(self, path: Path) -> trimesh.Trimesh:
+        loaded = trimesh.load(path)
+        mesh = loaded.to_geometry() if isinstance(loaded, trimesh.Scene) else loaded
+        if path.suffix.lower() in (".glb", ".gltf"):
+            mesh.apply_transform(self.GLTF_TO_MODEL_FRAME)
+        return mesh
+
+    @staticmethod
+    def _png_complete(path: Path) -> bool:
+        """A PNG written to the end finishes with an IEND chunk; truncated files don't."""
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            f.seek(max(0, size - 12))
+            return b"IEND" in f.read()
+
+    @staticmethod
+    def _label_pose(label: dict) -> Pose:
+        # The labels give q_CT scalar-last with R_CT = quat2dcm(q) (MATLAB Aerospace), which is
+        # the transpose of scipy's from_quat(q).as_matrix(); Pose expects scipy's convention.
+        q = Rotation.from_quat([label["rotation"][axis] for axis in "xyzw"]).inv().as_quat()
+        t = label["translation"]
+        return Pose(t["x"], t["y"], t["z"], q[0], q[1], q[2], q[3])
+
+    def _load_data(self):
+        with open(self.path / self.INTRINSICS_FILE) as f:
+            intrinsics = json.load(f)
+        camera_intrinsics = np.array(intrinsics["K"], dtype=np.float32)
+        distortion_coeffs = np.array(intrinsics.get("D", np.zeros(5)), dtype=np.float32)
+        with open(self.path / self.LABELS_FILE) as f:
+            labels = json.load(f)["poses"]
+
+        images = {}
+        for image_path in (self.path / self.IMAGE_DIR).glob("*.png"):
+            match = re.fullmatch(r".*_(\d+(?:\.\d+)?)", image_path.stem)
+            if match:
+                images[round(float(match.group(1)), 3)] = image_path
+
+        rows = []
+        for label in labels:
+            timestamp = round(float(label["timestamp"]), 3)
+            image_path = images.get(timestamp)
+            if image_path is None:
+                logger.warning("Skipping frame %s: no image in %s.", timestamp, self.path / self.IMAGE_DIR)
+                continue
+            if not self._png_complete(image_path):
+                logger.warning("Skipping frame %s: %s is truncated.", timestamp, image_path.name)
+                continue
+            rows.append({
+                "id": len(rows),
+                "recording": f"block_{int(timestamp) // self.FRAMES_PER_BLOCK:03d}",
+                "pose": self._label_pose(label),
+                "camera_intrinsics": camera_intrinsics,
+                "distortion_coeffs": distortion_coeffs,
+                "image": image_path,
+                "class": label.get("class"),
+                "visibility": label.get("visibility"),
+            })
+        logger.info("Loaded %d samples from %d labels in %s.", len(rows), len(labels), self.path)
+        return pd.DataFrame(rows)
+
+
+DATASET_LOADERS: dict[str, type[DataLoader]] = {
+    DataLoader.FORMAT: DataLoader,
+    EO1DataLoader.FORMAT: EO1DataLoader,
+}
+
+
+def open_dataset(
+    path: Path,
+    dataset_format: str | None = None,
+    mesh_scale: float | None = None,
+    recenter_mesh: bool | None = None,
+) -> DataLoader:
+    """Load a dataset with the loader for its layout (detected when ``dataset_format`` is None)."""
+    if dataset_format is None:
+        dataset_format = EO1DataLoader.FORMAT if EO1DataLoader.matches(path) else DataLoader.FORMAT
+    loader_cls = DATASET_LOADERS[dataset_format]
+    logger.info("Reading %s as the %r layout.", path, dataset_format)
+    return loader_cls(Path(path), mesh_scale=mesh_scale, recenter_mesh=recenter_mesh)

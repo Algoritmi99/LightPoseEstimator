@@ -8,17 +8,17 @@ from torchvision.models import mobilenet_v3_small
 
 from .roi import ROI
 
-# The detector sees every image resized to this (width, height). Boxes are predicted in
+# Default (width, height) the detector resizes every image to. Boxes are predicted in
 # coordinates normalized by the image size, so they map back to any input resolution.
 ROI_INPUT_SIZE = (320, 240)
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-def resize_for_roi(image: torch.Tensor) -> torch.Tensor:
-    """Resize a [C, H, W] or [B, C, H, W] image to ROI_INPUT_SIZE (antialiased bilinear)."""
+def resize_for_roi(image: torch.Tensor, size: tuple[int, int] = ROI_INPUT_SIZE) -> torch.Tensor:
+    """Resize a [C, H, W] or [B, C, H, W] image to ``size`` (width, height), antialiased bilinear."""
     batch = image if image.ndim == 4 else image.unsqueeze(0)
-    width, height = ROI_INPUT_SIZE
+    width, height = size
     if batch.shape[-2:] != (height, width):
         batch = F.interpolate(
             batch, size=(height, width), mode="bilinear", align_corners=False, antialias=True
@@ -36,8 +36,13 @@ def denormalize_roi(x: torch.Tensor, roi: torch.Tensor) -> torch.Tensor:
 
 
 class ROIDetector(nn.Module):
-    def __init__(self, backbone: nn.Module | None = None):
+    def __init__(
+        self,
+        backbone: nn.Module | None = None,
+        input_size: tuple[int, int] = ROI_INPUT_SIZE,
+    ):
         super().__init__()
+        self.input_size = tuple(input_size)
         self.feature_extractor = cast(
             nn.Module,
             mobilenet_v3_small(weights="DEFAULT").features if backbone is None else backbone.features
@@ -63,9 +68,9 @@ class ROIDetector(nn.Module):
         self.__backbone_frozen = False
 
     @classmethod
-    def load(cls, path: str | Path) -> "ROIDetector":
+    def load(cls, path: str | Path, input_size: tuple[int, int] = ROI_INPUT_SIZE) -> "ROIDetector":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = cls()
+        model = cls(input_size=input_size)
         model.load_state_dict(
             torch.load(path, map_location=device, weights_only=True)
         )
@@ -77,7 +82,7 @@ class ROIDetector(nn.Module):
         :param x: image batch [B, 3, H, W] with values in [0, 1], any resolution
         :return: normalized ROI tensor
         """
-        x = (resize_for_roi(x) - self.mean) / self.std
+        x = (resize_for_roi(x, self.input_size) - self.mean) / self.std
         x = self.feature_extractor(x)
         x = self.pool(x)
         x = torch.flatten(x, 1)

@@ -97,7 +97,14 @@ It reports how often a pose is returned, the translation and rotation error, and
 frames within `--max-translation-error` (default 5 cm) and `--max-rotation-error` (default 5°).
 `--csv results.csv` writes per-frame results.
 
-## Dataset layout
+## Dataset layouts
+
+`train.py` and `eval_pipe.py` detect the layout (`--dataset-format` overrides it) and take the
+mesh units and recentring from it unless `--mesh-scale` / `--[no-]recenter-mesh` are given.
+Both layouts are read into the same columns, so every dataset and trainer works on either.
+
+Recordings (`recordings`, the Astrobee data; `DataLoader`): mesh in mm, pose frame at the mesh's
+bounding-box centre (so it is scaled by 0.001 and recentred).
 
 ```
 data/Astrobee/
@@ -108,3 +115,29 @@ data/Astrobee/
     *_imgs/
     *_imgs_undistorted/
 ```
+
+Single folder of independent renders (`eo1`, the Polimi EO-1 data; `EO1DataLoader`): mesh in
+metres, poses relative to the model origin (not recentred). The glTF mesh is converted from
+glTF's Y-up axes to the labels' Z-up model frame, and the labels' MATLAB-convention quaternion
+to scipy's. Truncated PNGs are skipped with a warning. Frames are grouped in blocks of 50 for
+the train/val/test split.
+
+```
+EO1 Dataset/
+  EO1.glb
+  camera_intrinsics.json     # K (pinhole, no distortion)
+  pose_labels.json           # per frame: timestamp, class, visibility, translation, rotation
+  dataset/
+    main_camera_<k>.000.png
+```
+
+```bash
+python train.py --dataset "EO1 Dataset" --epochs 30 --output pose_estimator_eo1
+```
+
+```bash
+python eval_pipe.py --run-dir pose_estimator_eo1_30 --dataset "EO1 Dataset" --max-translation-error 0.5
+```
+
+At 10-70 m, translation error is better judged relative to distance; `eval_pipe.py` reports
+both, and a per-class breakdown when the labels have classes.

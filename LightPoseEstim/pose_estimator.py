@@ -19,7 +19,7 @@ from .kp.keypoint_heatmap import DEFAULT_PEAK_THRESHOLD, KeypointHeatmapNet
 from .pose import Pose
 from .projection import as_dist_coeffs, project_points, projectable_mask, ray_rotation
 from .roi import ROI, roi_to_bbox
-from .roi.roi_detector import ROIDetector
+from .roi.roi_detector import ROI_INPUT_SIZE, ROIDetector
 
 ROI_CHECKPOINT_RELATIVE = Path("roi") / "roi_detector.pth"
 RUN_CONFIG_RELATIVE = Path("config.json")
@@ -52,7 +52,13 @@ class PoseEstimator:
         crop_size: int = 256,
         peak_threshold: float = DEFAULT_PEAK_THRESHOLD,
         device: torch.device | None = None,
+        resolve_symmetry: bool = True,
     ):
+        """
+        ``resolve_symmetry`` corrects 180-degree flips with the keypoint net's coarse
+        rotation. It assumes the object frame's origin is the object's centre, as for the
+        recentered Astrobee mesh; switch it off for objects that are not near-symmetric.
+        """
         self.roi_detector = roi_detector
         self.keypoint_net = keypoint_net
         self.keypoints = keypoints
@@ -63,6 +69,7 @@ class PoseEstimator:
         self.distortion_coeffs = distortion_coeffs
         self.crop_size = crop_size
         self.peak_threshold = peak_threshold
+        self.resolve_symmetry = resolve_symmetry
         self.device = (
             device
             if device is not None
@@ -85,6 +92,8 @@ class PoseEstimator:
         crop_size: int = 256,
         peak_threshold: float = DEFAULT_PEAK_THRESHOLD,
         device: torch.device | None = None,
+        roi_input_size: tuple[int, int] = ROI_INPUT_SIZE,
+        resolve_symmetry: bool = True,
     ) -> "PoseEstimator":
         if keypoint_run_dir is not None:
             if keypoint_net_path is not None or keypoints_path is not None:
@@ -104,7 +113,7 @@ class PoseEstimator:
         elif keypoints_path is not None:
             raise ValueError("Provide only one of keypoints or keypoints_path.")
         return cls(
-            roi_detector=ROIDetector.load(roi_detector_path),
+            roi_detector=ROIDetector.load(roi_detector_path, input_size=roi_input_size),
             keypoint_net=KeypointHeatmapNet.load(
                 keypoint_net_path,
                 num_keypoints=len(keypoints),
@@ -115,6 +124,7 @@ class PoseEstimator:
             crop_size=crop_size,
             peak_threshold=peak_threshold,
             device=device,
+            resolve_symmetry=resolve_symmetry,
         )
 
     @classmethod
@@ -137,6 +147,8 @@ class PoseEstimator:
             crop_size=int(config["crop_size"]),
             peak_threshold=peak_threshold,
             device=device,
+            roi_input_size=tuple(config.get("roi_input_size", ROI_INPUT_SIZE)),
+            resolve_symmetry=bool(config.get("resolve_symmetry", True)),
         )
 
     def estimate(self, image) -> PoseEstimationResult | list[PoseEstimationResult]:
@@ -178,7 +190,8 @@ class PoseEstimator:
         max_error = max(_MIN_REPROJECTION_ERROR_PX, _REPROJECTION_ERROR_CELLS * cell_px)
         pose = self._solve_pose(image_points, confidence, max_error)
         if pose is not None:
-            pose = self._resolve_symmetry(pose, rotation[0].cpu().numpy())
+            if self.resolve_symmetry:
+                pose = self._resolve_symmetry(pose, rotation[0].cpu().numpy())
             if self._pose_outside_fov(pose, height, width):
                 pose = None
         return PoseEstimationResult(

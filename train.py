@@ -6,13 +6,15 @@ from pathlib import Path
 import torch
 
 from LightPoseEstim import (
-    DataLoader,
     KeypointHeatmapTrainer,
     MeshKeypointSelector,
+    ROIDetector,
     ROIDetectorTrainer,
+    open_dataset,
     save_canonical_keypoints,
 )
 from LightPoseEstim.dataloader import (
+    DATASET_LOADERS,
     DEFAULT_SPLIT_SEED,
     DEFAULT_TEST_FRACTION,
     DEFAULT_VAL_FRACTION,
@@ -22,88 +24,155 @@ from LightPoseEstim.pose_estimator import ROI_CHECKPOINT_RELATIVE, RUN_CONFIG_RE
 
 DEFAULT_DATASET = Path(__file__).resolve().parent / "data" / "Astrobee"
 DEFAULT_OUTPUT = Path("pose_estimator")
+ROI_INPUT_WIDTH = 320
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Train the ROI detector and keypoint heatmap net, then save a run "
+            "Train the ROI detector and keypoint heatmap net, then save a run\n"
             "directory that PoseEstimator.load_run can load."
         ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  python train.py --dataset /path/to/Dataset_2 --epochs 30\n"
+            "  python train.py --dataset \"/path/to/EO1 Dataset\" --epochs 60 --patience 20 \\\n"
+            "      --output pose_estimator_eo1\n"
+            "\n"
+            "Evaluate a finished run with eval_pipe.py --run-dir <run directory> --dataset <same dataset>."
+        ),
     )
-    parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
-    parser.add_argument("--margin", type=float, default=1.3)
-    parser.add_argument("--crop-size", type=int, default=256)
-    parser.add_argument("--keypoint-count", type=int, default=24)
-    parser.add_argument("--mesh-scale", type=float, default=0.001)
-    parser.add_argument(
-        "--no-recenter-mesh",
-        action="store_true",
-        help="Do not translate mesh so its bbox center is at the origin.",
+
+    data = parser.add_argument_group("data")
+    data.add_argument(
+        "--dataset",
+        type=Path,
+        default=DEFAULT_DATASET,
+        help="Dataset root directory (default: %(default)s).",
     )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=30,
-        help="Maximum epochs for each network; the learning rate decays to 0 over them.",
+    data.add_argument(
+        "--dataset-format",
+        choices=sorted(DATASET_LOADERS),
+        default=None,
+        help="Dataset layout (default: detected; 'eo1' when pose_labels.json and dataset/ exist).",
     )
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument(
-        "--patience",
-        type=int,
-        default=8,
-        help="Stop a network's training after this many epochs without a better val loss.",
+    data.add_argument(
+        "--mesh-scale",
+        type=float,
+        default=None,
+        help="Mesh units to metres (default: the layout's; 0.001 for recordings, 1 for eo1).",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="Seed for keypoint selection and network initialisation.",
+    data.add_argument(
+        "--recenter-mesh",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Translate the mesh so its bbox centre is the origin (default: the layout's; "
+            "on for recordings, off for eo1, whose poses are relative to the model origin)."
+        ),
     )
-    parser.add_argument(
+    data.add_argument(
         "--val-fraction",
         type=float,
         default=DEFAULT_VAL_FRACTION,
-        help="Share of recordings held out for checkpoint selection.",
+        help="Share of recordings held out for checkpoint selection (default: %(default)s).",
     )
-    parser.add_argument(
+    data.add_argument(
         "--test-fraction",
         type=float,
         default=DEFAULT_TEST_FRACTION,
-        help="Share of recordings held out for eval_pipe.py; never used in training.",
+        help="Share of recordings held out for eval_pipe.py; never used in training (default: %(default)s).",
     )
-    parser.add_argument("--split-seed", type=int, default=DEFAULT_SPLIT_SEED)
-    parser.add_argument(
+    data.add_argument(
+        "--split-seed",
+        type=int,
+        default=DEFAULT_SPLIT_SEED,
+        help="Seed for assigning recordings to train/val/test (default: %(default)s).",
+    )
+
+    model = parser.add_argument_group("model")
+    model.add_argument(
+        "--margin",
+        type=float,
+        default=1.3,
+        help="ROI size relative to the object's projected box (default: %(default)s).",
+    )
+    model.add_argument(
+        "--crop-size",
+        type=int,
+        default=256,
+        help="Side of the square ROI crop the keypoint net sees, in pixels (default: %(default)s).",
+    )
+    model.add_argument(
+        "--keypoint-count",
+        type=int,
+        default=24,
+        help="Number of mesh keypoints to select and detect (default: %(default)s).",
+    )
+
+    training = parser.add_argument_group("training")
+    training.add_argument(
+        "--epochs",
+        type=int,
+        default=30,
+        help=(
+            "Maximum epochs for each network; the learning rate decays to 0 over them, so a "
+            "larger value also keeps the rate high for longer (default: %(default)s)."
+        ),
+    )
+    training.add_argument(
+        "--lr",
+        type=float,
+        default=1e-3,
+        help="Starting learning rate for both networks (default: %(default)s).",
+    )
+    training.add_argument(
+        "--patience",
+        type=int,
+        default=8,
+        help="Stop a network's training after this many epochs without a better val loss (default: %(default)s).",
+    )
+    training.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Seed for keypoint selection and network initialisation (default: %(default)s).",
+    )
+    training.add_argument(
         "--roi-batch-size",
         type=int,
         default=64,
-        help="ROI batch size. Images are downscaled to 320x240, so 64 needs little memory.",
+        help="ROI batch size. Images are downscaled to 320 px wide, so 64 needs little memory (default: %(default)s).",
     )
-    parser.add_argument(
+    training.add_argument(
         "--kp-batch-size",
         type=int,
         default=48,
-        help="Keypoint batch size. 48 uses about 1.5 GB on 256x256 crops.",
+        help="Keypoint batch size. 48 uses about 1.5 GB on 256x256 crops (default: %(default)s).",
     )
-    parser.add_argument(
+    training.add_argument(
         "--workers",
         type=int,
         default=8,
-        help="Data-loader worker processes. Overlaps image loading with GPU training.",
+        help="Data-loader worker processes. Overlaps image loading with GPU training (default: %(default)s).",
     )
-    parser.add_argument(
+
+    output = parser.add_argument_group("output")
+    output.add_argument(
         "--output",
         type=Path,
         default=DEFAULT_OUTPUT,
         help=(
-            "Run directory base path. Training writes {stem}_{epochs}/ with the "
-            "ROI detector, keypoint net, canonical keypoints, and config."
+            "Run directory base path. Training writes {stem}_{epochs}/ with the ROI detector, "
+            "keypoint net, canonical keypoints, and config, overwriting an existing directory "
+            "of that name (default: %(default)s)."
         ),
     )
-    parser.add_argument(
+    output.add_argument(
         "--no-tensorboard",
         action="store_true",
-        help="Disable TensorBoard logging (enabled by default).",
+        help="Disable TensorBoard logging to runs/{run directory name}/ (enabled by default).",
     )
     return parser.parse_args()
 
@@ -116,10 +185,29 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args()
 
-    loader = DataLoader(
+    loader = open_dataset(
         args.dataset,
+        dataset_format=args.dataset_format,
         mesh_scale=args.mesh_scale,
-        recenter_mesh=not args.no_recenter_mesh,
+        recenter_mesh=args.recenter_mesh,
+    )
+    image_width, image_height = loader.image_size()
+    # Keep the image's aspect ratio at a height the backbone's stride 32 divides.
+    roi_input_size = (
+        ROI_INPUT_WIDTH,
+        max(32, round(ROI_INPUT_WIDTH * image_height / image_width / 32) * 32),
+    )
+    # Symmetric flips are resolved about the origin, so only when it is the bbox centre.
+    resolve_symmetry = loader.recenter_mesh
+    logging.info(
+        "Dataset %s: %d frames of %dx%d, mesh scale %s, recentered %s, ROI input %dx%d",
+        loader.FORMAT,
+        len(loader.data),
+        image_width,
+        image_height,
+        loader.mesh_scale,
+        loader.recenter_mesh,
+        *roi_input_size,
     )
     run_dir = run_directory(args.output, args.epochs)
     roi_path = run_dir / ROI_CHECKPOINT_RELATIVE
@@ -155,7 +243,8 @@ def main():
         args.workers,
     )
     ROIDetectorTrainer(
-        loader.get_roi_dataset(margin=args.margin),
+        loader.get_roi_dataset(margin=args.margin, input_size=roi_input_size),
+        model=ROIDetector(input_size=roi_input_size),
         batch_size=args.roi_batch_size,
         num_workers=args.workers,
         split=split,
@@ -197,10 +286,13 @@ def main():
 
     config_path = run_dir / RUN_CONFIG_RELATIVE
     config = {
+        "dataset_format": loader.FORMAT,
         "crop_size": args.crop_size,
         "margin": args.margin,
-        "mesh_scale": args.mesh_scale,
-        "recenter_mesh": not args.no_recenter_mesh,
+        "mesh_scale": loader.mesh_scale,
+        "recenter_mesh": loader.recenter_mesh,
+        "roi_input_size": list(roi_input_size),
+        "resolve_symmetry": resolve_symmetry,
         "seed": args.seed,
         "lr": args.lr,
         "split_seed": args.split_seed,

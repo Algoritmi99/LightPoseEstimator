@@ -9,7 +9,7 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-from LightPoseEstim import DataLoader, Pose, PoseEstimator
+from LightPoseEstim import Pose, PoseEstimator, open_dataset
 from LightPoseEstim.dataloader import RecordingSplit, _get_2d_roi
 from LightPoseEstim.kp import DEFAULT_PEAK_THRESHOLD
 from LightPoseEstim.pose_estimator import RUN_CONFIG_RELATIVE
@@ -83,6 +83,7 @@ def estimator_for(estimators: dict, base: PoseEstimator, row) -> PoseEstimator:
             crop_size=base.crop_size,
             peak_threshold=base.peak_threshold,
             device=base.device,
+            resolve_symmetry=base.resolve_symmetry,
         )
     return estimators[key]
 
@@ -107,10 +108,11 @@ def main():
 
     with (args.run_dir / RUN_CONFIG_RELATIVE).open() as handle:
         config = json.load(handle)
-    loader = DataLoader(
+    loader = open_dataset(
         args.dataset,
-        mesh_scale=config.get("mesh_scale", 0.001),
-        recenter_mesh=config.get("recenter_mesh", True),
+        dataset_format=config.get("dataset_format"),
+        mesh_scale=config.get("mesh_scale"),
+        recenter_mesh=config.get("recenter_mesh"),
     )
     data = loader.data
 
@@ -172,8 +174,10 @@ def main():
         records.append({
             "recording": row["recording"],
             "image": str(row["image"]),
+            "class": row.get("class"),
             "in_view": gt_roi.w > 0 and gt_roi.h > 0,
             "has_pose": result.pose is not None,
+            "distance_m": float(np.linalg.norm(row["pose"].get_tvec())),
             "translation_error_m": translation_error,
             "rotation_error_deg": rotation_error,
         })
@@ -182,6 +186,7 @@ def main():
     has_pose = np.array([r["has_pose"] for r in records])
     translation = np.array([r["translation_error_m"] for r in records])
     rotation = np.array([r["rotation_error_deg"] for r in records])
+    distance = np.array([r["distance_m"] for r in records])
     scored = in_view & has_pose
     success = (
         scored
@@ -204,11 +209,22 @@ def main():
         f"{int(has_pose[~in_view].sum())} (should be 0)"
     )
     print(f"Translation error:  {summarize(translation[scored], 100.0, 'cm')}")
+    print(f"  ... of distance:  {summarize(translation[scored] / distance[scored], 100.0, '%')}")
     print(f"Rotation error:     {summarize(rotation[scored], 1.0, 'deg')}")
     print(
         f"Success (<= {args.max_translation_error * 100:g} cm and <= {args.max_rotation_error:g} deg): "
         f"{int(success.sum())} of {n_in_view} in-view frames ({percent(int(success.sum()), n_in_view)})"
     )
+
+    classes = [r["class"] for r in records]
+    if any(c is not None for c in classes):
+        for name in sorted({c for c in classes if c is not None}):
+            mask = np.array([c == name for c in classes])
+            frames, n_in = int(mask.sum()), int((mask & in_view).sum())
+            print(
+                f"  class {name:10s}: {frames:4d} frames, pose for {percent(int((mask & has_pose).sum()), frames)}, "
+                f"success {percent(int((mask & success).sum()), n_in)} of {n_in} in view"
+            )
 
     if args.csv is not None:
         with args.csv.open("w", newline="") as handle:
