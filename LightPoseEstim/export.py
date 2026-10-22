@@ -9,6 +9,7 @@ each step is spelled out in the generated README.md, so it can be reimplemented 
 import contextlib
 import copy
 import json
+import platform
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,15 @@ MANIFEST_NAME = "pose_estimator.json"
 README_NAME = "README.md"
 ENTRY_POINT = "forward"
 _VERIFY_TOLERANCE = 1e-3
+# CPU packages are machine code. Inductor builds for the exporting machine (-march=native)
+# unless told otherwise, and such a package crashes (illegal instruction) on a CPU lacking
+# its instructions. Targets: name -> (GCC -march, Inductor vector width in bits; 1 = none).
+CPU_TARGETS = {
+    "native": (None, None),          # whatever the exporting machine has
+    "x86-64-v4": ("x86-64-v4", 512),  # AVX-512: Intel Skylake-X/Ice Lake+, AMD Zen 4+
+    "x86-64-v3": ("x86-64-v3", 256),  # AVX2 + FMA: Intel Haswell+, AMD Zen+ (most x86 since ~2015)
+    "x86-64-v2": ("x86-64-v2", 1),    # SSE4.2, no explicit vector kernels: nearly any 64-bit x86
+}
 
 
 class _Entry(torch.nn.Module):
@@ -81,12 +91,31 @@ def _verify(package: Path, model: torch.nn.Module, examples: list[torch.Tensor])
         return max(_max_difference(model(x), runner(x)) for x in examples)
 
 
-def export_pose_estimator(estimator, out_dir: str | Path, device: str | torch.device | None = None, verify: bool = True) -> Path:
+def _default_cpu_target(device: torch.device) -> str:
+    # A CPU package is meant to run elsewhere; AVX2 runs on almost every x86 CPU in use.
+    if device.type == "cpu" and platform.machine() in ("x86_64", "AMD64"):
+        return "x86-64-v3"
+    return "native"
+
+
+def export_pose_estimator(
+    estimator,
+    out_dir: str | Path,
+    device: str | torch.device | None = None,
+    verify: bool = True,
+    cpu_target: str | None = None,
+) -> Path:
     """See PoseEstimator.export."""
     from . import pose_estimator as pe
 
     out = Path(out_dir)
     device = torch.device(device) if device is not None else estimator.device
+    cpu_target = cpu_target or _default_cpu_target(device)
+    if cpu_target not in CPU_TARGETS:
+        raise ValueError(f"cpu_target must be one of {sorted(CPU_TARGETS)}, not {cpu_target!r}.")
+    if cpu_target.startswith("x86-64") and platform.machine() not in ("x86_64", "AMD64"):
+        raise ValueError(f"{cpu_target} is an x86 target; export on an x86 machine, or use 'native'.")
+    march, simdlen = CPU_TARGETS[cpu_target]
     if device.type == "cuda":
         from torch.utils.cpp_extension import CUDA_HOME
         if CUDA_HOME is None:
@@ -105,17 +134,23 @@ def export_pose_estimator(estimator, out_dir: str | Path, device: str | torch.de
 
     # The ROI detector resizes internally, so it accepts any camera image size.
     roi_example = torch.rand(1, 3, 960, 1280, device=device)
-    roi_package = export_model(
-        roi_detector,
-        {ENTRY_POINT: (roi_example,)},
-        out / "roi_detector",
-        dynamic_shapes={ENTRY_POINT: {"args": ({2: Dim("height", min=16, max=16384), 3: Dim("width", min=16, max=16384)},)}},
-    )[ENTRY_POINT]
-    keypoint_package = export_model(
-        keypoint_net,
-        {ENTRY_POINT: (torch.rand(1, 3, crop_size, crop_size, device=device),)},
-        out / "keypoint_net",
-    )[ENTRY_POINT]
+    # Without dynamic threads, Inductor bakes this machine's thread count into every parallel
+    # loop (num_threads(16) here), oversubscribing smaller CPUs whatever their thread setting.
+    target_config = {"cpp.dynamic_threads": True}
+    if march is not None:
+        target_config |= {"cpp.march": march, "cpp.simdlen": simdlen}
+    with torch._inductor.config.patch(target_config):
+        roi_package = export_model(
+            roi_detector,
+            {ENTRY_POINT: (roi_example,)},
+            out / "roi_detector",
+            dynamic_shapes={ENTRY_POINT: {"args": ({2: Dim("height", min=16, max=16384), 3: Dim("width", min=16, max=16384)},)}},
+        )[ENTRY_POINT]
+        keypoint_package = export_model(
+            keypoint_net,
+            {ENTRY_POINT: (torch.rand(1, 3, crop_size, crop_size, device=device),)},
+            out / "keypoint_net",
+        )[ENTRY_POINT]
 
     verification = None
     if verify:
@@ -138,6 +173,7 @@ def export_pose_estimator(estimator, out_dir: str | Path, device: str | torch.de
         "format_version": EXPORT_FORMAT_VERSION,
         "torch_version": torch.__version__,
         "device": device.type,
+        "cpu_target": {"name": cpu_target, "machine": platform.machine(), "march": march or "native"},
         "networks": {
             "roi_detector": {
                 "package": roi_package.relative_to(out).as_posix(),
@@ -184,6 +220,16 @@ def export_pose_estimator(estimator, out_dir: str | Path, device: str | torch.de
     return out
 
 
+def _target_note(m: dict) -> str:
+    notes = {
+        "native": " (the exporting machine): they may crash with an illegal instruction on a CPU\nlacking any of that machine's instruction sets.",
+        "x86-64-v4": ": they need AVX-512 (Intel Skylake-X/Ice Lake or later, AMD Zen 4 or\nlater) and crash with an illegal instruction without it.",
+        "x86-64-v3": ": they need AVX2 and FMA (Intel Haswell or later, AMD Zen or later) and\ncrash with an illegal instruction without them.",
+        "x86-64-v2": ": they need SSE4.2, which nearly every 64-bit x86 CPU has.",
+    }
+    return notes[m["cpu_target"]["name"]]
+
+
 def _tf32_note(m: dict) -> str:
     if m["device"] != "cuda":
         return ""
@@ -215,6 +261,9 @@ def _readme(m: dict) -> str:
 
 Exported with PyTorch {m['torch_version']} for `{m['device']}`. All values below come from
 `{MANIFEST_NAME}`; this file describes how to run the pipeline around the two networks.
+
+The packages contain machine code for `{m['cpu_target']['machine']}`, built for
+`{m['cpu_target']['name']}`{_target_note(m)}
 
 ## Files
 

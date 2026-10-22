@@ -37,9 +37,11 @@ private:
     c10::Device device;
     torch::inductor::AOTIModelPackageLoader roiDetector;
     torch::inductor::AOTIModelPackageLoader keyPointNet;
-    // Pixel value -> float32 in [0, 1], computed on the CPU as torchvision's ToTensor does:
-    // dividing on the GPU rounds 126 of the 256 values differently (by 1 ulp).
+    // Pixel value -> float32 in [0, 1], computed on the CPU as torchvision's ToTensor does
+    // (dividing on the GPU rounds 126 of the 256 values differently, by 1 ulp): on the device,
+    // and as an OpenCV lookup table for converting images on the CPU in one pass.
     at::Tensor pixelToFloat;
+    cv::Mat pixelLut;
     // float32 like the Python estimator, so PnP sees the same numbers.
     cv::Mat cameraMatrix;
     cv::Mat distCoeffs;

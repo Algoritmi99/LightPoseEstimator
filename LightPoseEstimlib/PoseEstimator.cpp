@@ -7,6 +7,7 @@
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
+#include <cstring>
 #include <cmath>
 #include <limits>
 #include <numbers>
@@ -147,6 +148,9 @@ PoseEstimator::PoseEstimator(const std::filesystem::path& exportDir)
       maxValidRadius(std::numeric_limits<double>::infinity()) {
     for (const Eigen::Vector3d& p : config.keypointPositions)
         objectPoints.emplace_back(static_cast<float>(p.x()), static_cast<float>(p.y()), static_cast<float>(p.z()));
+    const at::Tensor values = pixelToFloat.to(torch::kCPU).contiguous();
+    pixelLut = cv::Mat(1, 256, CV_32F);
+    std::memcpy(pixelLut.data, values.data_ptr<float>(), 256 * sizeof(float));
     setCamera(config.cameraIntrinsics, config.distortionCoeffs);
 }
 
@@ -162,21 +166,39 @@ void PoseEstimator::setCamera(const Eigen::Matrix3d& cameraIntrinsics, const std
 PoseEstimationResult PoseEstimator::estimate(const cv::Mat& image, bool isBgr) {
     if (image.empty()) throw std::invalid_argument("Empty image.");
     if (image.depth() != CV_8U) throw std::invalid_argument("Expected an 8-bit image.");
-    cv::Mat rgb;
+    const int rows = image.rows, cols = image.cols;
+    if (!device.is_cpu()) {
+        // GPU: upload the 8-bit image as it is; look values up and reorder channels there.
+        cv::Mat three;
+        bool bgr = isBgr;
+        switch (image.channels()) {
+            case 1: cv::cvtColor(image, three, cv::COLOR_GRAY2RGB); bgr = false; break;
+            case 3: three = image.isContinuous() ? image : image.clone(); break;
+            case 4: cv::cvtColor(image, three, isBgr ? cv::COLOR_BGRA2BGR : cv::COLOR_RGBA2RGB); break;
+            default: throw std::invalid_argument("Expected an image with 1, 3 or 4 channels.");
+        }
+        const at::Tensor bytes = torch::from_blob(three.data, {rows, cols, 3}, torch::kUInt8).to(device);
+        at::Tensor hwc = pixelToFloat.index_select(0, bytes.flatten().to(torch::kInt32)).view({rows, cols, 3});
+        if (bgr) hwc = hwc.flip(2);
+        return estimate(hwc.permute({2, 0, 1}));
+    }
+
+    // CPU: 8-bit planes in R, G, B order (grey repeated, alpha dropped, as PIL's convert("RGB")).
+    std::vector<cv::Mat> planes;
     switch (image.channels()) {
-        case 1: cv::cvtColor(image, rgb, cv::COLOR_GRAY2RGB); break;
-        case 3: if (isBgr) cv::cvtColor(image, rgb, cv::COLOR_BGR2RGB); else rgb = image; break;
-        case 4: cv::cvtColor(image, rgb, isBgr ? cv::COLOR_BGRA2RGB : cv::COLOR_RGBA2RGB); break;
+        case 1: planes = {image, image, image}; break;
+        case 3: case 4: cv::split(image, planes); planes.resize(3); break;
         default: throw std::invalid_argument("Expected an image with 1, 3 or 4 channels.");
     }
-    if (!rgb.isContinuous()) rgb = rgb.clone();
-    // As torchvision's ToTensor: uint8 HWC -> float32 CHW / 255. On the GPU the values are looked
-    // up instead, so only the 8-bit image is copied and the result matches the CPU division.
-    const at::Tensor bytes = torch::from_blob(rgb.data, {rgb.rows, rgb.cols, 3}, torch::kUInt8);
-    if (device.is_cpu())
-        return estimate(bytes.permute({2, 0, 1}).to(torch::kFloat32).div(255));
-    const at::Tensor tensor = pixelToFloat.index_select(0, bytes.to(device).flatten().to(torch::kInt32))
-                                  .view({rgb.rows, rgb.cols, 3}).permute({2, 0, 1});
+    if (isBgr && image.channels() > 1) std::swap(planes[0], planes[2]);
+
+    // As torchvision's ToTensor (uint8 HWC -> float32 CHW / 255), through the lookup table:
+    // one pass per plane, written straight into the tensor's channel planes.
+    at::Tensor tensor = torch::empty({3, rows, cols}, torch::kFloat32);
+    for (int c = 0; c < 3; ++c) {
+        cv::Mat plane(rows, cols, CV_32F, tensor[c].data_ptr<float>());
+        cv::LUT(planes[c], pixelLut, plane);
+    }
     return estimate(tensor);
 }
 

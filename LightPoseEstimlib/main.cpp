@@ -4,6 +4,7 @@
 
 #include <torch/torch.h>
 #include <ATen/Context.h>
+#include <opencv2/core/utility.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <nlohmann/json.hpp>
 #include <chrono>
@@ -12,20 +13,34 @@
 
 // Runs an exported pose estimator on images and prints one JSON object per image.
 // --full-float32 turns off TF32 on CUDA, for results closest to the Python reference.
+// --threads N limits LibTorch's CPU threads (set OMP_NUM_THREADS=N too: CPU packages run
+// their kernels on the system OpenMP runtime).
 int main(int argc, char** argv) {
     std::vector<std::string> args(argv + 1, argv + argc);
     bool fullFloat32 = false;
-    if (!args.empty() && args.front() == "--full-float32") {
-        fullFloat32 = true;
+    int threads = 0;
+    while (!args.empty() && args.front().starts_with("--")) {
+        if (args.front() == "--full-float32") {
+            fullFloat32 = true;
+        } else if (args.front() == "--threads" && args.size() > 1) {
+            threads = std::stoi(args[1]);
+            args.erase(args.begin());
+        } else {
+            break;
+        }
         args.erase(args.begin());
     }
     if (args.size() < 2) {
-        std::cerr << "Usage: main [--full-float32] <export_dir> <image>...\n";
+        std::cerr << "Usage: main [--full-float32] [--threads N] <export_dir> <image>...\n";
         return 2;
     }
     if (fullFloat32) {
         at::globalContext().setAllowTF32CuDNN(false);
         at::globalContext().setAllowTF32CuBLAS(false);
+    }
+    if (threads > 0) {
+        at::set_num_threads(threads);
+        cv::setNumThreads(threads);
     }
     std::cerr << "torch " << TORCH_VERSION
               << ", CUDA available: " << torch::cuda::is_available() << "\n";

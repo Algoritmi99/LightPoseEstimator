@@ -190,6 +190,7 @@ class PoseEstimator:
         out_dir: str | Path,
         device: str | torch.device | None = None,
         verify: bool = True,
+        cpu_target: str | None = None,
     ) -> Path:
         """
         Write everything needed to run this estimator outside Python (e.g. C++ with
@@ -206,10 +207,14 @@ class PoseEstimator:
         PnP and the other geometry are not compiled. A CUDA export needs a CUDA toolkit
         (CUDA_HOME). With ``verify``, each package is loaded back and compared with the
         PyTorch network; a mismatch raises.
+
+        ``cpu_target`` is the instruction set the packages' CPU code may use (see
+        export.CPU_TARGETS): a package crashes on a CPU lacking it. Default: "x86-64-v3"
+        (AVX2) for CPU exports on x86, "native" (this machine) otherwise.
         """
         from .export import export_pose_estimator
 
-        return export_pose_estimator(self, out_dir, device=device, verify=verify)
+        return export_pose_estimator(self, out_dir, device=device, verify=verify, cpu_target=cpu_target)
 
     def estimate(self, image) -> PoseEstimationResult | list[PoseEstimationResult]:
         batch = self._to_batch(image)
