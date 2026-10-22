@@ -19,6 +19,7 @@ from LightPoseEstim.dataloader import (
     DEFAULT_TEST_FRACTION,
     DEFAULT_VAL_FRACTION,
 )
+from LightPoseEstim.calibration import DEFAULT_KEEP_FRACTION, calibrate_run
 from LightPoseEstim.keypoint_selector import KEYPOINTS_FILENAME, KEYPOINTS_SUBDIR, NET_SUBDIR
 from LightPoseEstim.pose_estimator import ROI_CHECKPOINT_RELATIVE, RUN_CONFIG_RELATIVE
 
@@ -134,6 +135,16 @@ def parse_args():
         help="Stop a network's training after this many epochs without a better val loss (default: %(default)s).",
     )
     training.add_argument(
+        "--low-light-augmentation",
+        type=float,
+        default=0.0,
+        metavar="SHARE",
+        help=(
+            "Share of training images darkened to simulate poor lighting, 0 = off (default: "
+            "%(default)s). At 0.3 on EO-1 it did not help dim frames and cost some accuracy."
+        ),
+    )
+    training.add_argument(
         "--seed",
         type=int,
         default=0,
@@ -173,6 +184,15 @@ def parse_args():
         "--no-tensorboard",
         action="store_true",
         help="Disable TensorBoard logging to runs/{run directory name}/ (enabled by default).",
+    )
+    output.add_argument(
+        "--gate-keep-fraction",
+        type=float,
+        default=DEFAULT_KEEP_FRACTION,
+        help=(
+            "After training, calibrate the pose quality checks on the validation frames so each "
+            "keeps this share of good poses; 0 turns the checks off (default: %(default)s)."
+        ),
     )
     return parser.parse_args()
 
@@ -243,7 +263,11 @@ def main():
         args.workers,
     )
     ROIDetectorTrainer(
-        loader.get_roi_dataset(margin=args.margin, input_size=roi_input_size),
+        loader.get_roi_dataset(
+            margin=args.margin,
+            input_size=roi_input_size,
+            low_light=args.low_light_augmentation,
+        ),
         model=ROIDetector(input_size=roi_input_size),
         batch_size=args.roi_batch_size,
         num_workers=args.workers,
@@ -264,6 +288,7 @@ def main():
         keypoints,
         crop_size=args.crop_size,
         margin=args.margin,
+        low_light=args.low_light_augmentation,
     )
 
     logging.info(
@@ -295,10 +320,13 @@ def main():
         "resolve_symmetry": resolve_symmetry,
         "seed": args.seed,
         "lr": args.lr,
+        "low_light_augmentation": args.low_light_augmentation,
         "split_seed": args.split_seed,
         "split": split.to_dict(),
     }
     config_path.write_text(json.dumps(config, indent=2) + "\n")
+    if args.gate_keep_fraction > 0:
+        calibrate_run(run_dir, loader, keep_fraction=args.gate_keep_fraction)
     logging.info("Saved pose estimator run to %s", run_dir)
 
 

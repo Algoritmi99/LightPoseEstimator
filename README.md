@@ -81,6 +81,8 @@ python train.py --dataset data/Astrobee --epochs 30
 Each network trains in one stage with the whole model unfrozen, at `--lr` (default 1e-3)
 decaying to 0 over `--epochs`, and stops early after `--patience` epochs without a better
 validation loss. `--seed` fixes keypoint selection and initialisation, so runs are comparable.
+`--low-light-augmentation 0.3` darkens that share of training images to simulate poor
+lighting; it is off by default because on EO-1 it did not help dim frames and cost some accuracy.
 
 Data is split by recording, not by frame, so near-identical neighbouring frames never land
 in both training and validation. By default 70% of recordings train, 15% validate (checkpoint
@@ -96,6 +98,26 @@ python eval_pipe.py --run-dir pose_estimator_20 --dataset data/Astrobee
 It reports how often a pose is returned, the translation and rotation error, and the share of
 frames within `--max-translation-error` (default 5 cm) and `--max-rotation-error` (default 5°).
 `--csv results.csv` writes per-frame results.
+
+### Pose quality checks
+
+A pose is rejected (no pose instead of a wrong one) when its evidence is poor, typically a
+target too dark to see:
+
+- the PnP rotation disagrees with the keypoint net's coarse whole-crop rotation by more than
+  `max_rotation_disagreement` degrees, or
+- the PnP inliers' mean heatmap confidence is below `min_keypoint_confidence`.
+
+`train.py` calibrates both on the validation frames after training, so each keeps 99% of good
+poses (`--gate-keep-fraction`), and stores them in `config.json`. A run whose orientation head is
+unreliable gets no rotation check. For runs trained before this existed:
+
+```bash
+python calibrate_gates.py --run-dir pose_estimator_eo1_30 --dataset "EO1 Dataset"
+```
+
+`PoseEstimationResult.rejected` says why a frame got no pose; `eval_pipe.py` counts the reasons
+and `--no-quality-gates` evaluates without the checks.
 
 ## Dataset layouts
 

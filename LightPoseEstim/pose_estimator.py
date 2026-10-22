@@ -1,3 +1,4 @@
+import copy
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,14 @@ class PoseEstimationResult:
     roi: ROI
     image_points: np.ndarray
     confidence: np.ndarray
+    inliers: int = 0
+    # Mean heatmap peak of the PnP inliers, and degrees between the PnP rotation and the
+    # keypoint net's coarse whole-crop rotation: both drop/grow when the evidence is poor.
+    keypoint_confidence: float = float("nan")
+    rotation_disagreement: float = float("nan")
+    # Why ``pose`` is None: "no target in view", "too few keypoints", "outside field of
+    # view", "rotation disagreement" or "low keypoint confidence".
+    rejected: str | None = None
 
 
 class PoseEstimator:
@@ -53,11 +62,17 @@ class PoseEstimator:
         peak_threshold: float = DEFAULT_PEAK_THRESHOLD,
         device: torch.device | None = None,
         resolve_symmetry: bool = True,
+        max_rotation_disagreement: float | None = None,
+        min_keypoint_confidence: float | None = None,
     ):
         """
         ``resolve_symmetry`` corrects 180-degree flips with the keypoint net's coarse
         rotation. It assumes the object frame's origin is the object's centre, as for the
         recentered Astrobee mesh; switch it off for objects that are not near-symmetric.
+
+        ``max_rotation_disagreement`` (degrees) and ``min_keypoint_confidence`` reject poses
+        built on poor evidence, e.g. a target too dark to see; None skips a check. Calibrate
+        them per run with calibration.calibrate_run, as train.py does.
         """
         self.roi_detector = roi_detector
         self.keypoint_net = keypoint_net
@@ -70,6 +85,8 @@ class PoseEstimator:
         self.crop_size = crop_size
         self.peak_threshold = peak_threshold
         self.resolve_symmetry = resolve_symmetry
+        self.max_rotation_disagreement = max_rotation_disagreement
+        self.min_keypoint_confidence = min_keypoint_confidence
         self.device = (
             device
             if device is not None
@@ -94,6 +111,8 @@ class PoseEstimator:
         device: torch.device | None = None,
         roi_input_size: tuple[int, int] = ROI_INPUT_SIZE,
         resolve_symmetry: bool = True,
+        max_rotation_disagreement: float | None = None,
+        min_keypoint_confidence: float | None = None,
     ) -> "PoseEstimator":
         if keypoint_run_dir is not None:
             if keypoint_net_path is not None or keypoints_path is not None:
@@ -125,6 +144,8 @@ class PoseEstimator:
             peak_threshold=peak_threshold,
             device=device,
             resolve_symmetry=resolve_symmetry,
+            max_rotation_disagreement=max_rotation_disagreement,
+            min_keypoint_confidence=min_keypoint_confidence,
         )
 
     @classmethod
@@ -149,7 +170,46 @@ class PoseEstimator:
             device=device,
             roi_input_size=tuple(config.get("roi_input_size", ROI_INPUT_SIZE)),
             resolve_symmetry=bool(config.get("resolve_symmetry", True)),
+            max_rotation_disagreement=config.get("max_rotation_disagreement"),
+            min_keypoint_confidence=config.get("min_keypoint_confidence"),
         )
+
+    def with_camera(
+        self,
+        camera_intrinsics: np.ndarray,
+        distortion_coeffs: np.ndarray | None = None,
+    ) -> "PoseEstimator":
+        """The same networks and settings with another camera calibration."""
+        estimator = copy.copy(self)
+        estimator.camera_intrinsics = np.asarray(camera_intrinsics, dtype=np.float32)
+        estimator.distortion_coeffs = distortion_coeffs
+        return estimator
+
+    def export(
+        self,
+        out_dir: str | Path,
+        device: str | torch.device | None = None,
+        verify: bool = True,
+    ) -> Path:
+        """
+        Write everything needed to run this estimator outside Python (e.g. C++ with
+        LibTorch) into ``out_dir``:
+
+        - ``roi_detector/forward.pt2``, ``keypoint_net/forward.pt2``: the networks' forward
+          passes compiled with torch.export + AOTInductor, for ``device`` (default: the
+          estimator's). The ROI detector accepts any image size.
+        - ``pose_estimator.json``: keypoints, camera intrinsics and distortion, crop size,
+          heatmap stride, peak threshold, PnP settings, symmetry and quality checks.
+        - ``README.md``: each step around the networks (ROI box, crop, peak decoding, PnP,
+          checks) as formulas with these values, to reimplement as is.
+
+        PnP and the other geometry are not compiled. A CUDA export needs a CUDA toolkit
+        (CUDA_HOME). With ``verify``, each package is loaded back and compared with the
+        PyTorch network; a mismatch raises.
+        """
+        from .export import export_pose_estimator
+
+        return export_pose_estimator(self, out_dir, device=device, verify=verify)
 
     def estimate(self, image) -> PoseEstimationResult | list[PoseEstimationResult]:
         batch = self._to_batch(image)
@@ -188,18 +248,38 @@ class PoseEstimator:
         confidence = confidence[0].cpu().numpy()
         cell_px = stride * max(box[2] - box[0], box[3] - box[1]) / self.crop_size
         max_error = max(_MIN_REPROJECTION_ERROR_PX, _REPROJECTION_ERROR_CELLS * cell_px)
-        pose = self._solve_pose(image_points, confidence, max_error)
-        if pose is not None:
-            if self.resolve_symmetry:
-                pose = self._resolve_symmetry(pose, rotation[0].cpu().numpy())
-            if self._pose_outside_fov(pose, height, width):
-                pose = None
-        return PoseEstimationResult(
-            pose=pose,
+        result = PoseEstimationResult(
+            pose=None,
             roi=roi,
             image_points=image_points,
             confidence=confidence,
         )
+        pose, inliers = self._solve_pose(image_points, confidence, max_error)
+        if pose is None:
+            result.rejected = "too few keypoints"
+            return result
+
+        allocentric = rotation[0].cpu().numpy()
+        if self.resolve_symmetry:
+            pose = self._resolve_symmetry(pose, allocentric)
+        result.inliers = int(inliers.sum())
+        result.keypoint_confidence = float(confidence[inliers].mean())
+        result.rotation_disagreement = self.rotation_disagreement(pose, allocentric)
+        if self._pose_outside_fov(pose, height, width):
+            result.rejected = "outside field of view"
+        elif (
+            self.max_rotation_disagreement is not None
+            and result.rotation_disagreement > self.max_rotation_disagreement
+        ):
+            result.rejected = "rotation disagreement"
+        elif (
+            self.min_keypoint_confidence is not None
+            and result.keypoint_confidence < self.min_keypoint_confidence
+        ):
+            result.rejected = "low keypoint confidence"
+        else:
+            result.pose = pose
+        return result
 
     def _discarded_pose(self, roi: ROI) -> PoseEstimationResult:
         count = len(self.keypoints)
@@ -208,6 +288,7 @@ class PoseEstimator:
             roi=roi,
             image_points=np.zeros((count, 2), dtype=np.float32),
             confidence=np.zeros(count, dtype=np.float32),
+            rejected="no target in view",
         )
 
     @staticmethod
@@ -238,6 +319,13 @@ class PoseEstimator:
         return not bool(np.any(inside))
 
     @staticmethod
+    def rotation_disagreement(pose: Pose, allocentric: np.ndarray) -> float:
+        """Degrees between the pose's rotation and the net's coarse (allocentric) rotation."""
+        coarse = ray_rotation(pose.get_tvec()) @ allocentric
+        relative = pose.quaternion.to_rotation_matrix().T @ coarse
+        return float(np.degrees(np.arccos(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0))))
+
+    @staticmethod
     def _resolve_symmetry(pose: Pose, allocentric: np.ndarray) -> Pose:
         """
         Keypoints on a near-symmetric object can land on the wrong side, which turns the
@@ -261,11 +349,14 @@ class PoseEstimator:
         image_points: np.ndarray,
         confidence: np.ndarray,
         max_error: float,
-    ) -> Pose | None:
-        """RANSAC PnP; keypoints reprojecting more than ``max_error`` px away are outliers."""
+    ) -> tuple[Pose | None, np.ndarray | None]:
+        """
+        RANSAC PnP; keypoints reprojecting more than ``max_error`` px away are outliers.
+        Returns the pose and the inlier mask over all keypoints.
+        """
         valid = confidence >= self.peak_threshold
         if int(valid.sum()) < _MIN_PNP_INLIERS:
-            return None
+            return None, None
 
         object_points = self.object_points[valid]
         points_2d = image_points[valid].reshape(-1, 1, 2).astype(np.float32)
@@ -281,7 +372,7 @@ class PoseEstimator:
             flags=cv2.SOLVEPNP_SQPNP,
         )
         if not success:
-            return None
+            return None, None
 
         # With 4 or 5 points OpenCV solves directly and reports every point as an
         # inlier, so count inliers from the reprojection error here.
@@ -290,7 +381,7 @@ class PoseEstimator:
         )
         inliers = np.linalg.norm(reprojected - points_2d, axis=2).ravel() <= max_error
         if int(inliers.sum()) < _MIN_PNP_INLIERS:
-            return None
+            return None, None
         rvec, tvec = cv2.solvePnPRefineLM(
             object_points[inliers],
             points_2d[inliers],
@@ -303,7 +394,9 @@ class PoseEstimator:
         rotation, _ = cv2.Rodrigues(rvec)
         qx, qy, qz, qw = Rotation.from_matrix(rotation).as_quat()
         t = tvec.reshape(3)
-        return Pose(float(t[0]), float(t[1]), float(t[2]), qx, qy, qz, qw)
+        inlier_mask = np.zeros(len(confidence), dtype=bool)
+        inlier_mask[np.flatnonzero(valid)[inliers]] = True
+        return Pose(float(t[0]), float(t[1]), float(t[2]), qx, qy, qz, qw), inlier_mask
 
     def _to_batch(self, image) -> list[torch.Tensor]:
         if isinstance(image, (list, tuple)):

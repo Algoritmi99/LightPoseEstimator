@@ -62,3 +62,11 @@ class Pose:
 
     def __repr__(self):
         return f"Pose(position={self.position}, quaternion={self.quaternion})"
+
+
+def pose_errors(pred: Pose, gt: Pose) -> tuple[float, float]:
+    """Translation error in metres and rotation error in degrees."""
+    translation = float(np.linalg.norm(pred.get_tvec() - gt.get_tvec()))
+    relative = pred.quaternion.to_rotation_matrix().T @ gt.quaternion.to_rotation_matrix()
+    cos_angle = np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0)
+    return translation, float(np.degrees(np.arccos(cos_angle)))

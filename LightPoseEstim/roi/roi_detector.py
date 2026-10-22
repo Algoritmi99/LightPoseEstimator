@@ -19,10 +19,11 @@ def resize_for_roi(image: torch.Tensor, size: tuple[int, int] = ROI_INPUT_SIZE) 
     """Resize a [C, H, W] or [B, C, H, W] image to ``size`` (width, height), antialiased bilinear."""
     batch = image if image.ndim == 4 else image.unsqueeze(0)
     width, height = size
-    if batch.shape[-2:] != (height, width):
-        batch = F.interpolate(
-            batch, size=(height, width), mode="bilinear", align_corners=False, antialias=True
-        )
+    # Always resized (a same-size resize is an exact no-op): a size check would pin the
+    # image size when the detector is exported with torch.export.
+    batch = F.interpolate(
+        batch, size=(height, width), mode="bilinear", align_corners=False, antialias=True
+    )
     return batch if image.ndim == 4 else batch.squeeze(0)
 
 

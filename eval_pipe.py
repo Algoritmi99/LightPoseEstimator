@@ -9,7 +9,8 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-from LightPoseEstim import Pose, PoseEstimator, open_dataset
+from LightPoseEstim import PoseEstimator, open_dataset
+from LightPoseEstim.pose import pose_errors
 from LightPoseEstim.dataloader import RecordingSplit, _get_2d_roi
 from LightPoseEstim.kp import DEFAULT_PEAK_THRESHOLD
 from LightPoseEstim.pose_estimator import RUN_CONFIG_RELATIVE
@@ -59,32 +60,19 @@ def parse_args():
     )
     parser.add_argument("--device", type=str, default=None, help="e.g. cpu or cuda (default: cuda if available).")
     parser.add_argument("--csv", type=Path, default=None, help="Write per-frame results to this CSV file.")
+    parser.add_argument(
+        "--no-quality-gates",
+        action="store_true",
+        help="Ignore the run's calibrated pose quality checks, to compare with and without them.",
+    )
     return parser.parse_args()
-
-
-def pose_errors(pred: Pose, gt: Pose) -> tuple[float, float]:
-    """Translation error in meters and rotation error in degrees."""
-    translation = float(np.linalg.norm(pred.get_tvec() - gt.get_tvec()))
-    relative = pred.quaternion.to_rotation_matrix().T @ gt.quaternion.to_rotation_matrix()
-    cos_angle = np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0)
-    return translation, float(np.degrees(np.arccos(cos_angle)))
 
 
 def estimator_for(estimators: dict, base: PoseEstimator, row) -> PoseEstimator:
     """Reuse the loaded nets with the camera calibration of this row's recording."""
     key = (row["camera_intrinsics"].tobytes(), row["distortion_coeffs"].tobytes())
     if key not in estimators:
-        estimators[key] = PoseEstimator(
-            roi_detector=base.roi_detector,
-            keypoint_net=base.keypoint_net,
-            keypoints=base.keypoints,
-            camera_intrinsics=row["camera_intrinsics"],
-            distortion_coeffs=row["distortion_coeffs"],
-            crop_size=base.crop_size,
-            peak_threshold=base.peak_threshold,
-            device=base.device,
-            resolve_symmetry=base.resolve_symmetry,
-        )
+        estimators[key] = base.with_camera(row["camera_intrinsics"], row["distortion_coeffs"])
     return estimators[key]
 
 
@@ -150,6 +138,14 @@ def main():
         peak_threshold=args.peak_threshold,
         device=torch.device(args.device) if args.device else None,
     )
+    if args.no_quality_gates:
+        base.max_rotation_disagreement = None
+        base.min_keypoint_confidence = None
+    logging.info(
+        "Pose quality checks: rotation disagreement <= %s deg, keypoint confidence >= %s",
+        base.max_rotation_disagreement,
+        base.min_keypoint_confidence,
+    )
     estimators = {}
 
     records = []
@@ -177,6 +173,7 @@ def main():
             "class": row.get("class"),
             "in_view": gt_roi.w > 0 and gt_roi.h > 0,
             "has_pose": result.pose is not None,
+            "rejected": result.rejected,
             "distance_m": float(np.linalg.norm(row["pose"].get_tvec())),
             "translation_error_m": translation_error,
             "rotation_error_deg": rotation_error,
@@ -208,6 +205,12 @@ def main():
         f"Object out of view: {n_out_of_view} frames, pose returned for "
         f"{int(has_pose[~in_view].sum())} (should be 0)"
     )
+    reasons = {}
+    for record in records:
+        if record["in_view"] and record["rejected"]:
+            reasons[record["rejected"]] = reasons.get(record["rejected"], 0) + 1
+    if reasons:
+        print("  no pose because:  " + ", ".join(f"{reason} {count}" for reason, count in sorted(reasons.items())))
     print(f"Translation error:  {summarize(translation[scored], 100.0, 'cm')}")
     print(f"  ... of distance:  {summarize(translation[scored] / distance[scored], 100.0, '%')}")
     print(f"Rotation error:     {summarize(rotation[scored], 1.0, 'deg')}")

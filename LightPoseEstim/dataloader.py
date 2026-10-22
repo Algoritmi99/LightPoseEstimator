@@ -173,11 +173,58 @@ def _gaussian_heatmap(height: int, width: int, cx: float, cy: float, sigma: floa
     return torch.from_numpy(heatmap)
 
 
-def _photometric_augmentation() -> T.Compose:
-    return T.Compose([
+class RandomLowLight:
+    """
+    Simulate a poorly lit target, since real dim frames are rare (3% of EO-1 is backlit):
+    scale the signal above the image's dark level down (log-uniform, to ~3%, about as dark
+    as backlit frames) while keeping that level, as a camera's noise floor stays, bend the
+    tone curve, add sensor noise and re-quantise to 8 bits, which is what erases detail at
+    low intensities. ``noise`` is the noise std range at the network's input resolution.
+
+    Opt-in (``low_light`` on the datasets): on EO-1, darkening 30% of training images gave no
+    gain on dim test frames and cost some accuracy on well-lit ones. Backlit targets are lit
+    only at their edges, which darkening a lit image does not reproduce.
+    """
+
+    def __init__(
+        self,
+        p: float = 0.3,
+        gain: tuple[float, float] = (0.03, 0.6),
+        gamma: tuple[float, float] = (0.8, 1.5),
+        noise: tuple[float, float] = (0.005, 0.02),
+    ):
+        self.p, self.gain, self.gamma, self.noise = p, gain, gamma, noise
+
+    def __call__(self, image: torch.Tensor) -> torch.Tensor:
+        # torch's RNG is seeded per DataLoader worker, unlike numpy's global one.
+        if float(torch.rand(())) >= self.p:
+            return image
+        u = torch.rand(3).tolist()
+        gain = float(np.exp(np.log(self.gain[0]) + u[0] * np.log(self.gain[1] / self.gain[0])))
+        gamma = self.gamma[0] + u[1] * (self.gamma[1] - self.gamma[0])
+        sigma = self.noise[0] + u[2] * (self.noise[1] - self.noise[0])
+        image = image.clamp(0.0, 1.0)
+        # Dark level: median of the border, which is almost always background.
+        border = torch.cat([image[:, :8].flatten(1), image[:, -8:].flatten(1),
+                            image[:, :, :8].flatten(1), image[:, :, -8:].flatten(1)], dim=1)
+        floor = border.median(dim=1).values[:, None, None]
+        image = torch.minimum(image, floor) + (image - floor).clamp_min(0.0).pow(gamma) * gain
+        image = image + torch.randn_like(image) * sigma
+        return (image.clamp(0.0, 1.0) * 255.0).round() / 255.0
+
+
+def _photometric_augmentation(
+    low_light: float = 0.0,
+    noise: tuple[float, float] = (0.005, 0.02),
+) -> T.Compose:
+    """Colour jitter and blur; with ``low_light`` > 0, also darken that share of images."""
+    transforms = [
         T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.02),
         T.RandomApply([T.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5))], p=0.3),
-    ])
+    ]
+    if low_light > 0:
+        transforms.append(RandomLowLight(p=low_light, noise=noise))
+    return T.Compose(transforms)
 
 
 def _jitter_roi(roi: ROI, shift: float = 0.2, scale: float = 0.25) -> ROI:
@@ -219,6 +266,7 @@ class ImageROIDataset(Dataset):
         margin: float = 1.4,
         augment: bool = False,
         input_size: tuple[int, int] = ROI_INPUT_SIZE,
+        low_light: float = 0.0,
     ):
         self.df = data
         self.mesh = mesh
@@ -226,7 +274,8 @@ class ImageROIDataset(Dataset):
         self.input_size = tuple(input_size)
         self.augment = augment
         self.transform = T.Compose([T.ToTensor()])
-        self.photometric = _photometric_augmentation()
+        # Downscaling to the ROI input averages sensor noise away, so add less of it.
+        self.photometric = _photometric_augmentation(low_light, noise=(0.002, 0.008))
 
     def with_augmentation(self, augment: bool) -> "ImageROIDataset":
         """Shallow copy sharing the loaded data, with zoom/flip/colour augmentation on or off."""
@@ -380,11 +429,12 @@ class ImageKPHeatmapROIDataset(ImageKPHeatmapDataset):
         margin: float = 1.4,
         heatmap_sigma: float = 2.0,
         augment: bool = False,
+        low_light: float = 0.0,
     ):
         super().__init__(data, mesh, keypoints, margin=margin, heatmap_sigma=heatmap_sigma)
         self.crop_size = crop_size
         self.augment = augment
-        self.photometric = _photometric_augmentation()
+        self.photometric = _photometric_augmentation(low_light)
 
     def with_augmentation(self, augment: bool) -> "ImageKPHeatmapROIDataset":
         """Shallow copy sharing the loaded data, with ROI jitter and colour/blur augmentation on or off."""
@@ -556,8 +606,13 @@ class DataLoader:
             raise ValueError("Dataset has no undistorted images.")
         return ImagePoseDataset(self.data)
 
-    def get_roi_dataset(self, margin: float = 1.4, input_size: tuple[int, int] = ROI_INPUT_SIZE):
-        return ImageROIDataset(self.data, self.mesh, margin=margin, input_size=input_size)
+    def get_roi_dataset(
+        self,
+        margin: float = 1.4,
+        input_size: tuple[int, int] = ROI_INPUT_SIZE,
+        low_light: float = 0.0,
+    ):
+        return ImageROIDataset(self.data, self.mesh, margin=margin, input_size=input_size, low_light=low_light)
 
     def get_kp_heatmap_dataset(self, keypoints: list[CanonicalKeypoint], margin: float = 1.4):
         return ImageKPHeatmapDataset(self.data, self.mesh, keypoints, margin=margin)
@@ -567,6 +622,7 @@ class DataLoader:
         keypoints: list[CanonicalKeypoint],
         crop_size: int = 256,
         margin: float = 1.4,
+        low_light: float = 0.0,
     ):
         return ImageKPHeatmapROIDataset(
             self.data,
@@ -574,6 +630,7 @@ class DataLoader:
             keypoints,
             crop_size=crop_size,
             margin=margin,
+            low_light=low_light,
         )
 
 
@@ -600,7 +657,8 @@ class EO1DataLoader(DataLoader):
     FRAMES_PER_BLOCK = 50
     # glTF stores meshes Y-up; the labels use the model's Z-up frame: (x, y, z) -> (x, -z, y).
     # Checked against the renders: this axis map and the label quaternion convention below
-    # are the only combination whose projected silhouette matches the target (IoU 0.74, next 0.44).
+    # are the only combination whose projected silhouette matches the target (IoU 0.77 against
+    # the lit pixels, next best 0.44).
     GLTF_TO_MODEL_FRAME = np.array([
         [1.0, 0.0, 0.0, 0.0],
         [0.0, 0.0, -1.0, 0.0],
