@@ -3,11 +3,12 @@ from pathlib import Path
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Subset
+import numpy as np
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from ..dataloader import ImageKPHeatmapROIDataset, RecordingSplit, split_by_recording
+from ..dataloader import ImageKPHeatmapROIDataset, RecordingSplit, init_worker, split_by_recording
 from .keypoint_heatmap import KeypointHeatmapNet, KeypointLoss
 
 
@@ -26,7 +27,10 @@ class KeypointHeatmapTrainer:
         use_tensorboard: bool = False,
         tensorboard_log_dir: str = "runs/keypoint_heatmap",
         augment: bool = True,
+        sample_weights: "np.ndarray | None" = None,
     ):
+        """``sample_weights`` (one per dataset row) draws training crops in proportion to them,
+        with replacement, instead of shuffling."""
         self.device = (
             device
             if device is not None
@@ -47,7 +51,13 @@ class KeypointHeatmapTrainer:
         )
         if num_workers > 0:
             loader_kwargs["persistent_workers"] = True
-        self.train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+            loader_kwargs["worker_init_fn"] = init_worker
+        if sample_weights is not None:
+            weights = torch.as_tensor(np.asarray(sample_weights)[split.indices(dataset.df, "train")], dtype=torch.double)
+            sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+            self.train_loader = DataLoader(train_dataset, sampler=sampler, **loader_kwargs)
+        else:
+            self.train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
         self.val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
 
         if model is None:

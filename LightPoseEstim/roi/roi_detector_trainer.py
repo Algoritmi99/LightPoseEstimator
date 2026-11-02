@@ -7,7 +7,7 @@ import torch
 from torch import nn
 from tqdm import tqdm
 
-from ..dataloader import ImageROIDataset, RecordingSplit, split_by_recording
+from ..dataloader import ImageROIDataset, RecordingSplit, init_worker, split_by_recording
 from .roi_detector import ROIDetector
 
 
@@ -48,6 +48,7 @@ class ROIDetectorTrainer:
         )
         if num_workers > 0:
             loader_kwargs["persistent_workers"] = True
+            loader_kwargs["worker_init_fn"] = init_worker
         self.train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
         self.val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
 

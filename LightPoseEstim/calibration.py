@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 
-from .dataloader import DataLoader, RecordingSplit
+from .dataloader import DataLoader, RecordingSplit, read_image
 from .pose import Pose, pose_errors
 from .pose_estimator import RUN_CONFIG_RELATIVE, PoseEstimator
 
@@ -88,7 +88,7 @@ def calibrate_run(
     first = rows.iloc[0]
     estimator = PoseEstimator.load_run(run_dir, first["camera_intrinsics"], first["distortion_coeffs"])
     frames = (
-        (row["image"], row["pose"], row["camera_intrinsics"], row["distortion_coeffs"])
+        (read_image(row), row["pose"], row["camera_intrinsics"], row["distortion_coeffs"])
         for _, row in tqdm(rows.iterrows(), total=len(rows), desc="Calibrating checks", unit="frame")
     )
     result = calibrate_quality_gates(estimator, frames, keep_fraction)

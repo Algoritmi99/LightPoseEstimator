@@ -1,8 +1,11 @@
 import argparse
+import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from LightPoseEstim import (
@@ -18,13 +21,21 @@ from LightPoseEstim.dataloader import (
     DEFAULT_SPLIT_SEED,
     DEFAULT_TEST_FRACTION,
     DEFAULT_VAL_FRACTION,
+    RecordingSplit,
 )
+from LightPoseEstim.kp import KeypointHeatmapNet, KeypointLoss, SymmetricKeypointLoss
+from LightPoseEstim.masks import BackgroundCompositor, build_background_pool, build_mask_cache
+from LightPoseEstim.projection import allocentric_rotation
+from LightPoseEstim.symmetry import KeypointSymmetry, TurnDistinctness, choose_reference, twin_balance_weights
 from LightPoseEstim.calibration import DEFAULT_KEEP_FRACTION, calibrate_run
 from LightPoseEstim.keypoint_selector import KEYPOINTS_FILENAME, KEYPOINTS_SUBDIR, NET_SUBDIR
-from LightPoseEstim.pose_estimator import ROI_CHECKPOINT_RELATIVE, RUN_CONFIG_RELATIVE
+from LightPoseEstim.pose_estimator import ROI_CHECKPOINT_RELATIVE, RUN_CONFIG_RELATIVE, TURN_DISTINCTNESS_FILENAME
 
 DEFAULT_DATASET = Path(__file__).resolve().parent / "data" / "Astrobee"
 DEFAULT_OUTPUT = Path("pose_estimator")
+DEFAULT_WORKERS = min(24, max(2, (os.cpu_count() or 4) * 3 // 4))
+DEFAULT_CACHE_DIR = Path("cache")
+BACKGROUND_PATCHES = 3000
 ROI_INPUT_WIDTH = 320
 
 
@@ -91,6 +102,36 @@ def parse_args():
         default=DEFAULT_SPLIT_SEED,
         help="Seed for assigning recordings to train/val/test (default: %(default)s).",
     )
+    data.add_argument(
+        "--split-from",
+        type=Path,
+        default=None,
+        metavar="RUN_DIR",
+        help=(
+            "Reuse another run's train/val/test recordings instead of drawing a split, so the two "
+            "runs are compared on the same held-out data. Recordings it doesn't list go to training."
+        ),
+    )
+    data.add_argument(
+        "--force-train",
+        nargs="+",
+        default=[],
+        metavar="PATTERN",
+        help=(
+            "Put recordings whose name matches a shell-style pattern into training even if the split "
+            "holds them out, e.g. '[0-9]*' for the random-pose renders of full_dataset."
+        ),
+    )
+    data.add_argument(
+        "--exclude-recordings",
+        nargs="+",
+        default=[],
+        metavar="PATTERN",
+        help=(
+            "Leave out recordings whose name matches a shell-style pattern, e.g. "
+            "'rec_run_2026-05-22-*'. Stored in the run, so eval_pipe.py leaves them out too."
+        ),
+    )
 
     model = parser.add_argument_group("model")
     model.add_argument(
@@ -110,6 +151,16 @@ def parse_args():
         type=int,
         default=24,
         help="Number of mesh keypoints to select and detect (default: %(default)s).",
+    )
+    model.add_argument(
+        "--symmetric-keypoints",
+        action="store_true",
+        help=(
+            "Choose keypoints in sets that the object's 180-degree turns map onto each other "
+            "(--keypoint-count must be a multiple of 4), let the heatmaps use any of the labellings "
+            "the turns induce, and train a classifier that picks the turn. For near-symmetric "
+            "objects whose keypoints otherwise swap with their twins on unseen data."
+        ),
     )
 
     training = parser.add_argument_group("training")
@@ -131,7 +182,7 @@ def parse_args():
     training.add_argument(
         "--patience",
         type=int,
-        default=8,
+        default=20,
         help="Stop a network's training after this many epochs without a better val loss (default: %(default)s).",
     )
     training.add_argument(
@@ -143,6 +194,49 @@ def parse_args():
             "Share of training images darkened to simulate poor lighting, 0 = off (default: "
             "%(default)s). At 0.3 on EO-1 it did not help dim frames and cost some accuracy."
         ),
+    )
+    training.add_argument(
+        "--background-augmentation",
+        type=float,
+        default=0.0,
+        metavar="SHARE",
+        help=(
+            "Share of keypoint training crops whose surroundings are replaced by a patch of another "
+            "training image or a plain dark background, so the net can't rely on the scenes it "
+            "saw; 0 = off (default: %(default)s). Renders object masks once into --cache-dir."
+        ),
+    )
+    training.add_argument(
+        "--random-erasing",
+        type=float,
+        default=0.0,
+        metavar="SHARE",
+        help="Share of keypoint training crops with a random rectangle of noise, 0 = off (default: %(default)s).",
+    )
+    training.add_argument(
+        "--oversample",
+        nargs="+",
+        default=[],
+        metavar="PATTERN=FACTOR",
+        help=(
+            "Draw keypoint-net training crops of recordings matching PATTERN FACTOR times as often, "
+            "e.g. '[0-9]*=2' for the random-pose renders, which show every view as each twin."
+        ),
+    )
+    training.add_argument(
+        "--balance-twins",
+        action="store_true",
+        help=(
+            "With --symmetric-keypoints: weight each crop's turn-classifier loss by how rare its "
+            "twin is among training crops with a similar view, so a view seen mostly as one twin "
+            "can't teach the classifier which turn it is."
+        ),
+    )
+    training.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=DEFAULT_CACHE_DIR,
+        help="Where object masks and background patches are cached between runs (default: %(default)s).",
     )
     training.add_argument(
         "--seed",
@@ -165,8 +259,12 @@ def parse_args():
     training.add_argument(
         "--workers",
         type=int,
-        default=8,
-        help="Data-loader worker processes. Overlaps image loading with GPU training (default: %(default)s).",
+        default=DEFAULT_WORKERS,
+        help=(
+            "Data-loader worker processes per loader. Image loading, not the GPU, limits training "
+            "speed, so this uses 3/4 of the CPU threads, up to 24; each worker takes about "
+            "250 MB (default: %(default)s)."
+        ),
     )
 
     output = parser.add_argument_group("output")
@@ -201,6 +299,68 @@ def run_directory(output: Path, epochs: int) -> Path:
     return output.parent / f"{output.stem}_{epochs}"
 
 
+def split_from_run(run_dir: Path, data) -> RecordingSplit:
+    """``run_dir``'s split restricted to the recordings in ``data``; any others go to training."""
+    config = json.loads((run_dir / RUN_CONFIG_RELATIVE).read_text())
+    present = set(data["recording"])
+    parts = {part: [r for r in config["split"][part] if r in present] for part in ("train", "val", "test")}
+    listed = set(sum(parts.values(), []))
+    new = sorted(present - listed)
+    if new:
+        logging.warning("%d recordings are not in %s's split; adding them to training: %s", len(new), run_dir, ", ".join(new))
+    return RecordingSplit(tuple(sorted(parts["train"] + new)), tuple(parts["val"]), tuple(parts["test"]))
+
+
+def force_into_training(split: RecordingSplit, patterns: list[str]) -> RecordingSplit:
+    """``split`` with every val/test recording matching a pattern moved to training."""
+    from fnmatch import fnmatchcase
+
+    moved = lambda name: any(fnmatchcase(name, p) for p in patterns)
+    extra = [r for r in split.val + split.test if moved(r)]
+    if extra:
+        logging.info("Moving %d held-out recordings into training (%s): %s", len(extra), ", ".join(patterns), ", ".join(extra))
+    return RecordingSplit(
+        tuple(sorted(split.train + tuple(extra))),
+        tuple(r for r in split.val if not moved(r)),
+        tuple(r for r in split.test if not moved(r)),
+    )
+
+
+def oversampling_weights(recordings, specs: list[str]) -> np.ndarray:
+    """Per-row sampling weights from 'PATTERN=FACTOR' specs (the last matching spec wins)."""
+    from fnmatch import fnmatchcase
+
+    rules = []
+    for spec in specs:
+        pattern, _, factor = spec.rpartition("=")
+        if not pattern:
+            raise SystemExit(f"--oversample expects PATTERN=FACTOR, got {spec!r}.")
+        rules.append((pattern, float(factor)))
+    weights = np.ones(len(recordings))
+    for k, name in enumerate(recordings):
+        for pattern, factor in rules:
+            if fnmatchcase(name, pattern):
+                weights[k] = factor
+    return weights
+
+
+def background_compositor(loader, split: RecordingSplit, args) -> BackgroundCompositor:
+    """Object masks for every frame, and background patches from training frames only."""
+    dataset_key = f"{args.dataset.resolve().name}-{hashlib.sha1(str(args.dataset.resolve()).encode()).hexdigest()[:8]}"
+    mask_dir = build_mask_cache(loader.data, loader.mesh, args.cache_dir / "masks" / dataset_key, args.workers)
+    train_rows = loader.data.iloc[split.indices(loader.data, "train")].reset_index(drop=True)
+    split_key = hashlib.sha1("\n".join(split.train).encode()).hexdigest()[:10]
+    pool = build_background_pool(
+        train_rows,
+        mask_dir,
+        args.cache_dir / "backgrounds" / f"{dataset_key}-{split_key}-{BACKGROUND_PATCHES}.npy",
+        count=BACKGROUND_PATCHES,
+        workers=args.workers,
+        seed=args.seed,
+    )
+    return BackgroundCompositor(mask_dir, pool, p=args.background_augmentation)
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args()
@@ -211,6 +371,7 @@ def main():
         mesh_scale=args.mesh_scale,
         recenter_mesh=args.recenter_mesh,
     )
+    excluded = loader.exclude_recordings(args.exclude_recordings)
     image_width, image_height = loader.image_size()
     # Keep the image's aspect ratio at a height the backbone's stride 32 divides.
     roi_input_size = (
@@ -229,6 +390,10 @@ def main():
         loader.recenter_mesh,
         *roi_input_size,
     )
+    if args.balance_twins and not args.symmetric_keypoints:
+        raise SystemExit("--balance-twins needs --symmetric-keypoints.")
+    if args.symmetric_keypoints and args.keypoint_count % 4:
+        raise SystemExit("--symmetric-keypoints needs a --keypoint-count that is a multiple of 4.")
     run_dir = run_directory(args.output, args.epochs)
     roi_path = run_dir / ROI_CHECKPOINT_RELATIVE
     keypoint_net_path = run_dir / NET_SUBDIR / "keypoint_heatmap.pth"
@@ -236,11 +401,16 @@ def main():
     for path in (roi_path, keypoint_net_path, keypoints_path):
         path.parent.mkdir(parents=True, exist_ok=True)
 
-    split = loader.split_by_recording(
-        val_fraction=args.val_fraction,
-        test_fraction=args.test_fraction,
-        seed=args.split_seed,
-    )
+    if args.split_from is not None:
+        split = split_from_run(args.split_from, loader.data)
+    else:
+        split = loader.split_by_recording(
+            val_fraction=args.val_fraction,
+            test_fraction=args.test_fraction,
+            seed=args.split_seed,
+        )
+    if args.force_train:
+        split = force_into_training(split, args.force_train)
     logging.info(
         "Split by recording: %d train, %d val, %d test",
         len(split.train),
@@ -278,17 +448,66 @@ def main():
     ).train(args.epochs, save_path=str(roi_path), patience=args.patience)
 
     logging.info("Selecting canonical keypoints from the mesh")
-    keypoints = MeshKeypointSelector(
-        final_keypoint_count=args.keypoint_count,
-        random_seed=args.seed,
-    ).select_keypoints(loader.mesh, keypoint_count=args.keypoint_count)
+    selector = MeshKeypointSelector(final_keypoint_count=args.keypoint_count, random_seed=args.seed)
+    if args.symmetric_keypoints:
+        keypoints = selector.select_symmetric_keypoints(loader.mesh, orbit_count=args.keypoint_count // 4)
+    else:
+        keypoints = selector.select_keypoints(loader.mesh, keypoint_count=args.keypoint_count)
     save_canonical_keypoints(keypoints_path, keypoints)
+    symmetry = KeypointSymmetry.from_keypoints(keypoints)
+    ambiguous_share = None
+    if symmetry is not None:
+        train_poses = loader.data["pose"].iloc[split.indices(loader.data, "train")]
+        symmetry.reference, ambiguous_share = choose_reference(
+            np.stack([allocentric_rotation(pose) for pose in train_poses]),
+            symmetry.turns,
+            symmetry.tolerance_deg,
+            seed=args.seed,
+        )
+        logging.info(
+            "Keypoints in %d symmetric sets; %.1f%% of training crops lie within %.0f deg of a "
+            "boundary between labellings and may use either.",
+            len(keypoints) // len(symmetry.turns),
+            100 * ambiguous_share,
+            symmetry.tolerance_deg,
+        )
+        # Where the object differs from its turned twins: the turn classifier learns "can't
+        # tell" where none of it faces the camera, and the estimator reports both twins there.
+        symmetry.distinctness = TurnDistinctness.from_mesh(loader.mesh, symmetry.turns, seed=args.seed)
+        symmetry.distinctness.save(keypoints_path.parent / TURN_DISTINCTNESS_FILENAME)
+        logging.info(
+            "Surface that differs under each turn: %s",
+            ", ".join(f"{100 * row.mean():.0f}%" for row in symmetry.distinctness.differs[1:]),
+        )
     logging.info("Loading dataset with images, ROI, and keypoint heatmaps")
+    background = None
+    if args.background_augmentation > 0:
+        background = background_compositor(loader, split, args)
+    sample_weights = oversampling_weights(loader.data["recording"], args.oversample) if args.oversample else None
+    turn_weights = None
+    if args.balance_twins:
+        train_rows = split.indices(loader.data, "train")
+        weights, share = twin_balance_weights(
+            np.stack([allocentric_rotation(pose) for pose in loader.data["pose"].iloc[train_rows]]),
+            symmetry,
+            sample_weights=sample_weights[train_rows] if sample_weights is not None else None,
+        )
+        turn_weights = np.ones(len(loader.data))
+        turn_weights[train_rows] = weights
+        logging.info(
+            "Twin balance: turn-loss weights %.2f-%.2f (10th-90th percentile %.2f-%.2f); %.0f%% of "
+            "training crops have views seen only as their own twin",
+            weights.min(), weights.max(), *np.percentile(weights, [10, 90]), 100 * np.mean(share >= 0.95),
+        )
     kp_dataset = loader.get_kp_heatmap_roi_dataset(
         keypoints,
         crop_size=args.crop_size,
         margin=args.margin,
         low_light=args.low_light_augmentation,
+        background=background,
+        random_erasing=args.random_erasing,
+        symmetry=symmetry,
+        turn_weights=turn_weights,
     )
 
     logging.info(
@@ -301,6 +520,12 @@ def main():
     )
     KeypointHeatmapTrainer(
         kp_dataset,
+        model=KeypointHeatmapNet(
+            num_keypoints=len(keypoints),
+            num_turns=len(symmetry.turns) if symmetry is not None else 0,
+        ),
+        criterion=SymmetricKeypointLoss(symmetry) if symmetry is not None else KeypointLoss(),
+        sample_weights=sample_weights,
         batch_size=args.kp_batch_size,
         num_workers=args.workers,
         split=split,
@@ -321,7 +546,19 @@ def main():
         "seed": args.seed,
         "lr": args.lr,
         "low_light_augmentation": args.low_light_augmentation,
+        "background_augmentation": args.background_augmentation,
+        "random_erasing": args.random_erasing,
+        "symmetric_keypoints": symmetry is not None,
+        "labelling_reference": symmetry.reference.tolist() if symmetry is not None else None,
+        "labelling_tolerance_deg": symmetry.tolerance_deg if symmetry is not None else None,
+        "ambiguous_training_share": ambiguous_share,
+        "exclude_recordings": args.exclude_recordings,
+        "force_train": args.force_train,
+        "oversample": args.oversample,
+        "balance_twins": args.balance_twins,
+        "excluded_recordings": excluded,
         "split_seed": args.split_seed,
+        "split_from": str(args.split_from) if args.split_from is not None else None,
         "split": split.to_dict(),
     }
     config_path.write_text(json.dumps(config, indent=2) + "\n")

@@ -108,6 +108,11 @@ def export_pose_estimator(
     """See PoseEstimator.export."""
     from . import pose_estimator as pe
 
+    if getattr(estimator, "symmetry", None) is not None:
+        raise NotImplementedError(
+            "Runs with keypoints in symmetric sets (train.py --symmetric-keypoints) can't be "
+            "exported yet: the C++ library doesn't handle the keypoint net's turn classifier."
+        )
     out = Path(out_dir)
     device = torch.device(device) if device is not None else estimator.device
     cpu_target = cpu_target or _default_cpu_target(device)

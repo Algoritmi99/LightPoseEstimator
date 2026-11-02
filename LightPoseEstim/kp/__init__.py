@@ -3,6 +3,7 @@ from .keypoint_heatmap import (
     HeatmapFocalLoss,
     KeypointHeatmapNet,
     KeypointLoss,
+    SymmetricKeypointLoss,
     heatmap_peaks,
     rotation_from_6d,
 )

@@ -1,4 +1,5 @@
 import copy
+import fnmatch
 import json
 import logging
 import re
@@ -6,6 +7,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pandas as pd
 import torch
@@ -94,6 +96,70 @@ def _find_image(image_dir: Path, timestamp, suffix: str = "") -> list[Path]:
             if image_path.exists():
                 return [image_path]
     return []
+
+
+# OpenCV conversions of raw Bayer mosaics to grayscale, by pattern name.
+BAYER_TO_GRAY = {
+    "BG": cv2.COLOR_BayerBG2GRAY,
+    "GB": cv2.COLOR_BayerGB2GRAY,
+    "RG": cv2.COLOR_BayerRG2GRAY,
+    "GR": cv2.COLOR_BayerGR2GRAY,
+}
+
+
+def read_image(row) -> Image.Image:
+    """
+    RGB image of a dataset row. Rows whose ``bayer_pattern`` names a pattern hold the raw sensor
+    mosaic; it is converted to grayscale (replicated to RGB) first.
+    """
+    pattern = row.get("bayer_pattern")
+    if not isinstance(pattern, str):
+        return Image.open(row["image"]).convert("RGB")
+    with Image.open(row["image"]) as image:
+        raw = np.asarray(image.convert("L"))
+    return Image.fromarray(cv2.cvtColor(raw, BAYER_TO_GRAY[pattern])).convert("RGB")
+
+
+def read_image_tensor(row) -> torch.Tensor:
+    """
+    Float [C, H, W] image in [0, 1] of a dataset row, with the values ``T.ToTensor()(read_image(row))``
+    has. Gray images, including RGB files whose channels are all equal, come back with C = 1:
+    the training transforms work per channel and keep gray images gray, so ``_as_rgb`` at the
+    end gives the network the same input for a third of the work.
+    """
+    pattern = row.get("bayer_pattern")
+    with Image.open(row["image"]) as image:
+        if isinstance(pattern, str):
+            pixels = cv2.cvtColor(np.asarray(image.convert("L")), BAYER_TO_GRAY[pattern])
+        elif image.mode == "L":
+            pixels = np.asarray(image)
+        else:
+            pixels = np.asarray(image.convert("RGB"))
+            if (pixels[..., 0] == pixels[..., 1]).all() and (pixels[..., 1] == pixels[..., 2]).all():
+                pixels = pixels[..., 0]
+    # Decoded PIL pixels are read-only; torch needs a writable array (copied only if it isn't).
+    tensor = torch.from_numpy(np.require(pixels, requirements=("C", "W")))
+    tensor = tensor.unsqueeze(0) if tensor.ndim == 2 else tensor.permute(2, 0, 1).contiguous()
+    return tensor.to(torch.float32).div(255)
+
+
+def _as_rgb(image: torch.Tensor) -> torch.Tensor:
+    """A one-channel image as three (a view; batching copies it)."""
+    return image.expand(3, -1, -1) if image.shape[0] == 1 else image
+
+
+def _apply_photometric(photometric: T.Compose, image: torch.Tensor, low_light: float) -> torch.Tensor:
+    # Colour jitter and blur keep a gray image gray (torchvision skips saturation and hue on one
+    # channel; on three equal ones they change values by under 1e-4), so one channel stays one.
+    # Simulated low light adds noise per channel, so it gets all three.
+    if low_light > 0:
+        image = _as_rgb(image)
+    return photometric(image)
+
+
+def init_worker(_worker_id: int) -> None:
+    """DataLoader worker setup: one OpenCV thread, as torch already uses in workers."""
+    cv2.setNumThreads(1)
 
 
 def _find_distorted_image_dir(directory: Path) -> Path:
@@ -273,7 +339,7 @@ class ImageROIDataset(Dataset):
         self.margin = margin
         self.input_size = tuple(input_size)
         self.augment = augment
-        self.transform = T.Compose([T.ToTensor()])
+        self.low_light = low_light
         # Downscaling to the ROI input averages sensor noise away, so add less of it.
         self.photometric = _photometric_augmentation(low_light, noise=(0.002, 0.008))
 
@@ -288,8 +354,7 @@ class ImageROIDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        image = Image.open(row["image"]).convert("RGB")
-        image = self.transform(image)
+        image = read_image_tensor(row)
 
         roi = _get_2d_roi(
             image.shape,
@@ -306,7 +371,7 @@ class ImageROIDataset(Dataset):
         image = resize_for_roi(image, self.input_size)
         if self.augment:
             image, target = self._augment(image, target)
-        return image, target
+        return _as_rgb(image), target
 
     def _augment(self, image: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # torch's RNG is seeded per DataLoader worker, unlike numpy's global one.
@@ -332,7 +397,8 @@ class ImageROIDataset(Dataset):
             if float(torch.rand(())) < 0.5:
                 image = image.flip(-1)
                 cx = 1.0 - cx
-        return self.photometric(image), torch.tensor([cx, cy, w, h], dtype=image.dtype)
+        image = _apply_photometric(self.photometric, image, self.low_light)
+        return image, torch.tensor([cx, cy, w, h], dtype=image.dtype)
 
 
 class ImageKPHeatmapDataset(Dataset):
@@ -349,7 +415,6 @@ class ImageKPHeatmapDataset(Dataset):
         self.margin = margin
         self.keypoints = keypoints
         self.heatmap_sigma = heatmap_sigma
-        self.transform = T.Compose([T.ToTensor()])
         self.visibility = self._compute_visibility()
 
     def _keypoint_positions(self) -> np.ndarray:
@@ -375,8 +440,7 @@ class ImageKPHeatmapDataset(Dataset):
         return visibility
 
     def _load_image(self, row) -> torch.Tensor:
-        image = Image.open(row["image"]).convert("RGB")
-        return self.transform(image)
+        return read_image_tensor(row)
 
     def _build_kp_heatmaps(self, idx: int, row, box: Box, out_size: tuple[int, int]) -> torch.Tensor:
         """
@@ -412,7 +476,7 @@ class ImageKPHeatmapDataset(Dataset):
         image = self._load_image(row)
         height, width = image.shape[-2:]
         heatmaps = self._build_kp_heatmaps(idx, row, (0, 0, width, height), (width, height))
-        return image, heatmaps, self._rotation_target(row)
+        return _as_rgb(image), heatmaps, self._rotation_target(row)
 
     @staticmethod
     def _rotation_target(row) -> torch.Tensor:
@@ -430,11 +494,32 @@ class ImageKPHeatmapROIDataset(ImageKPHeatmapDataset):
         heatmap_sigma: float = 2.0,
         augment: bool = False,
         low_light: float = 0.0,
+        background=None,
+        random_erasing: float = 0.0,
+        symmetry=None,
+        turn_weights: np.ndarray | None = None,
     ):
+        """
+        ``background`` (a ``masks.BackgroundCompositor``) replaces the scene around the object in
+        some augmented crops; ``random_erasing`` is the share of augmented crops that get a random
+        rectangle of noise, so no single part of the object is relied on. With ``symmetry`` (a
+        ``symmetry.KeypointSymmetry`` for keypoints in symmetric sets), each item also carries
+        the keypoint labellings its crop may use, for ``SymmetricKeypointLoss``, and with
+        ``turn_weights`` (one per row of ``data``, symmetry.twin_balance_weights) augmented items
+        also carry their turn-loss weight; unaugmented (validation) items weigh 1.
+        """
         super().__init__(data, mesh, keypoints, margin=margin, heatmap_sigma=heatmap_sigma)
         self.crop_size = crop_size
         self.augment = augment
+        self.low_light = low_light
         self.photometric = _photometric_augmentation(low_light)
+        self.background = background
+        self.symmetry = symmetry
+        self.turn_weights = turn_weights
+        self.erasing = (
+            T.RandomErasing(p=random_erasing, scale=(0.02, 0.12), ratio=(0.3, 3.3), value="random")
+            if random_erasing > 0 else None
+        )
 
     def with_augmentation(self, augment: bool) -> "ImageKPHeatmapROIDataset":
         """Shallow copy sharing the loaded data, with ROI jitter and colour/blur augmentation on or off."""
@@ -460,9 +545,25 @@ class ImageKPHeatmapROIDataset(ImageKPHeatmapDataset):
         box = crop_box(roi, height, width)
         crop = crop_and_resize(image, box, self.crop_size)
         if self.augment:
-            crop = self.photometric(crop)
+            if self.background is not None:
+                crop = self.background(crop, row, box)
+            crop = _apply_photometric(self.photometric, crop, self.low_light)
+            if self.erasing is not None:
+                crop = self.erasing(crop)
         heatmaps = self._build_kp_heatmaps(idx, row, box, (self.crop_size, self.crop_size))
-        return crop, heatmaps, self._rotation_target(row)
+        rotation = self._rotation_target(row)
+        if self.symmetry is not None:
+            allowed = torch.from_numpy(self.symmetry.allowed_turns(rotation.numpy()))
+            if self.symmetry.distinctness is None:
+                return _as_rgb(crop), heatmaps, rotation, allowed
+            pose = row["pose"]
+            informativeness = self.symmetry.distinctness.informativeness(pose.quaternion.to_rotation_matrix(), pose.get_tvec())
+            item = (_as_rgb(crop), heatmaps, rotation, allowed, torch.from_numpy(informativeness.astype(np.float32)))
+            if self.turn_weights is not None:
+                weight = float(self.turn_weights[idx]) if self.augment else 1.0
+                item += (torch.tensor(weight, dtype=torch.float32),)
+            return item
+        return _as_rgb(crop), heatmaps, rotation
 
 
 class DataLoader:
@@ -502,6 +603,9 @@ class DataLoader:
 
     def _read_mesh(self, path: Path) -> trimesh.Trimesh:
         return trimesh.load_mesh(path)
+
+    def _find_image(self, image_dir: Path, timestamp, suffix: str = "") -> list[Path]:
+        return _find_image(image_dir, timestamp, suffix)
 
     def _load_mesh(self):
         mesh = self._read_mesh(self._find_mesh_file())
@@ -553,7 +657,7 @@ class DataLoader:
                     row["x.1"], row["y.1"], row["z.1"], row["w"],
                 )
 
-                img_files = _find_image(imgs, row["Timestamp"])
+                img_files = self._find_image(imgs, row["Timestamp"])
                 if len(img_files) != 1:
                     logger.warning(
                         "Skipping row in %s at timestamp %s: found %d distorted image(s).",
@@ -566,6 +670,7 @@ class DataLoader:
                 sample = {
                     "id": len(rows),
                     "recording": directory.name,
+                    "timestamp": float(row["Timestamp"]),
                     "pose": pose,
                     "camera_intrinsics": camera_intrinsics,
                     "distortion_coeffs": distortion_coeffs,
@@ -601,6 +706,15 @@ class DataLoader:
     ) -> "RecordingSplit":
         return split_by_recording(self.data, val_fraction, test_fraction, seed)
 
+    def exclude_recordings(self, patterns: list[str]) -> list[str]:
+        """Drop the recordings whose name matches any shell-style pattern; returns their names."""
+        names = sorted(self.data["recording"].unique())
+        excluded = [name for name in names if any(fnmatch.fnmatchcase(name, p) for p in patterns)]
+        if excluded:
+            self.data = self.data[~self.data["recording"].isin(excluded)].reset_index(drop=True)
+            logger.info("Excluded %d recordings (%s); %d frames remain.", len(excluded), ", ".join(patterns), len(self.data))
+        return excluded
+
     def get_pose_dataset(self):
         if "image_undistorted" not in self.data.columns:
             raise ValueError("Dataset has no undistorted images.")
@@ -623,6 +737,10 @@ class DataLoader:
         crop_size: int = 256,
         margin: float = 1.4,
         low_light: float = 0.0,
+        background=None,
+        random_erasing: float = 0.0,
+        symmetry=None,
+        turn_weights: np.ndarray | None = None,
     ):
         return ImageKPHeatmapROIDataset(
             self.data,
@@ -631,6 +749,10 @@ class DataLoader:
             crop_size=crop_size,
             margin=margin,
             low_light=low_light,
+            background=background,
+            random_erasing=random_erasing,
+            symmetry=symmetry,
+            turn_weights=turn_weights,
         )
 
 
@@ -732,9 +854,68 @@ class EO1DataLoader(DataLoader):
         return pd.DataFrame(rows)
 
 
+class GodotDataLoader(DataLoader):
+    """
+    Recordings layout rendered in Godot (the merged Astrobee ``full_dataset``):
+    - one glTF/GLB mesh at the root, in metres, read in the Z-up model frame the poses refer to
+      (glTF's Y-up axes converted as for EO-1) with the pose frame at its bounding-box centre,
+    - per recording a ``_godot_imgs`` folder, one CSV and one JSON as in ``DataLoader``:
+      ``rec_run_*`` images are named after their time stamp (``1088_2.png``), numbered sets
+      (``164_*``, ``644_*``, ...) after their frame (``0000000040.jpg`` is the row with Timestamp 40),
+    - ``*_bayer`` recordings store the raw BG sensor mosaic; ``read_image`` converts it to grayscale.
+    """
+
+    FORMAT = "godot"
+    DEFAULT_MESH_SCALE = 1.0
+    DEFAULT_RECENTER_MESH = True
+    IMAGE_DIR = "_godot_imgs"
+    MESH_SUFFIXES = (".glb", ".gltf")
+    BAYER_SUFFIX = "_bayer"
+    BAYER_PATTERN = "BG"
+
+    @classmethod
+    def matches(cls, path: Path) -> bool:
+        path = Path(path)
+        if not path.is_dir():
+            return False
+        entries = list(path.iterdir())
+        has_gltf = any(p.is_file() and p.suffix.lower() in cls.MESH_SUFFIXES for p in entries)
+        return has_gltf and any((p / cls.IMAGE_DIR).is_dir() for p in entries if p.is_dir())
+
+    def _read_mesh(self, path: Path) -> trimesh.Trimesh:
+        # Geometry only: the materials' textures would add hundreds of MB.
+        mesh = trimesh.load(path, force="mesh", skip_materials=True)
+        if path.suffix.lower() in self.MESH_SUFFIXES:
+            mesh.apply_transform(EO1DataLoader.GLTF_TO_MODEL_FRAME)
+        return mesh
+
+    def _find_image(self, image_dir: Path, timestamp, suffix: str = "") -> list[Path]:
+        stamp = Decimal(str(timestamp))
+        if stamp == stamp.to_integral_value():
+            for extension in (".jpg", ".png"):
+                path = image_dir / f"{int(stamp):010d}{suffix}{extension}"
+                if path.exists():
+                    return [path]
+        return super()._find_image(image_dir, timestamp, suffix)
+
+    def _load_data(self):
+        data = super()._load_data()
+        if data.empty:
+            return data
+        bayer = data["recording"].str.endswith(self.BAYER_SUFFIX)
+        data["bayer_pattern"] = np.where(bayer, self.BAYER_PATTERN, None)
+        logger.info(
+            "%d samples in %d raw Bayer recordings are converted to grayscale when read.",
+            int(bayer.sum()),
+            data.loc[bayer, "recording"].nunique(),
+        )
+        return data
+
+
 DATASET_LOADERS: dict[str, type[DataLoader]] = {
     DataLoader.FORMAT: DataLoader,
     EO1DataLoader.FORMAT: EO1DataLoader,
+    GodotDataLoader.FORMAT: GodotDataLoader,
 }
 
 
@@ -746,7 +927,10 @@ def open_dataset(
 ) -> DataLoader:
     """Load a dataset with the loader for its layout (detected when ``dataset_format`` is None)."""
     if dataset_format is None:
-        dataset_format = EO1DataLoader.FORMAT if EO1DataLoader.matches(path) else DataLoader.FORMAT
+        dataset_format = next(
+            (cls.FORMAT for cls in (EO1DataLoader, GodotDataLoader) if cls.matches(path)),
+            DataLoader.FORMAT,
+        )
     loader_cls = DATASET_LOADERS[dataset_format]
     logger.info("Reading %s as the %r layout.", path, dataset_format)
     return loader_cls(Path(path), mesh_scale=mesh_scale, recenter_mesh=recenter_mesh)

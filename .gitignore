@@ -85,3 +85,6 @@ dmypy.json
 *.pth
 runs/
 keypoint_heatmap*/
+
+# Object masks and background patches (train.py --background-augmentation)
+cache/

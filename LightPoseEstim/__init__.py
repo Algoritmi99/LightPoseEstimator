@@ -13,11 +13,13 @@ from .roi import (
 from .dataloader import (
     DataLoader,
     EO1DataLoader,
+    GodotDataLoader,
     ImageKPHeatmapDataset,
     ImageKPHeatmapROIDataset,
     ImagePoseDataset,
     ImageROIDataset,
     open_dataset,
+    read_image,
 )
 from .kp import KeypointHeatmapNet, KeypointHeatmapTrainer, heatmap_peaks
 from .roi.roi_detector_trainer import ROIDetectorTrainer

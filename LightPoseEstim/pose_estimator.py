@@ -1,6 +1,6 @@
 import copy
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -21,9 +21,15 @@ from .pose import Pose
 from .projection import as_dist_coeffs, project_points, projectable_mask, ray_rotation
 from .roi import ROI, roi_to_bbox
 from .roi.roi_detector import ROI_INPUT_SIZE, ROIDetector
+from .symmetry import KeypointSymmetry, TurnDistinctness, compose_table
 
 ROI_CHECKPOINT_RELATIVE = Path("roi") / "roi_detector.pth"
 RUN_CONFIG_RELATIVE = Path("config.json")
+# Saved next to keypoints.npz by train.py for keypoints in symmetric sets.
+TURN_DISTINCTNESS_FILENAME = "turn_distinctness.npz"
+# Turn hypotheses at least this likely are reported as candidates; two or more make a result
+# ambiguous.
+CANDIDATE_MIN_PROBABILITY = 0.2
 
 # PnP outlier threshold: this many heatmap cells, mapped to full-image pixels.
 _REPROJECTION_ERROR_CELLS = 2.0
@@ -32,6 +38,14 @@ _MIN_REPROJECTION_ERROR_PX = 4.0
 _MIN_PNP_INLIERS = 5
 # Identity and 180-degree turns about the object x, y and z axes.
 _SYMMETRY_TURNS = [np.diag(signs).astype(np.float64) for signs in ((1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1))]
+
+
+@dataclass
+class TurnHypothesis:
+    """A pose for one of the object's turned twins, and how likely it is the true one."""
+    turn: int
+    probability: float
+    pose: Pose
 
 
 @dataclass
@@ -48,6 +62,23 @@ class PoseEstimationResult:
     # Why ``pose`` is None: "no target in view", "too few keypoints", "outside field of
     # view", "rotation disagreement" or "low keypoint confidence".
     rejected: str | None = None
+    # Keypoints in symmetric sets: the turn the classifier chose (index into symmetry.TURNS)
+    # and its probability.
+    turn: int | None = None
+    turn_confidence: float = float("nan")
+    # Keypoints in symmetric sets: a pose for every turn PnP could solve, likeliest first.
+    # ``pose`` is the first; ``candidates`` are those likely enough to report.
+    hypotheses: list[TurnHypothesis] = field(default_factory=list)
+
+    @property
+    def candidates(self) -> list[TurnHypothesis]:
+        """Twins this view can't rule out, likeliest first: one for a clear result, more when
+        the view can't tell them apart (e.g. a near-symmetric object seen from its symmetric side)."""
+        return [h for h in self.hypotheses if h.probability >= CANDIDATE_MIN_PROBABILITY] or self.hypotheses[:1]
+
+    @property
+    def ambiguous(self) -> bool:
+        return self.pose is not None and len(self.candidates) > 1
 
 
 class PoseEstimator:
@@ -64,6 +95,7 @@ class PoseEstimator:
         resolve_symmetry: bool = True,
         max_rotation_disagreement: float | None = None,
         min_keypoint_confidence: float | None = None,
+        distinctness: TurnDistinctness | None = None,
     ):
         """
         ``resolve_symmetry`` corrects 180-degree flips with the keypoint net's coarse
@@ -73,10 +105,22 @@ class PoseEstimator:
         ``max_rotation_disagreement`` (degrees) and ``min_keypoint_confidence`` reject poses
         built on poor evidence, e.g. a target too dark to see; None skips a check. Calibrate
         them per run with calibration.calibrate_run, as train.py does.
+
+        Keypoints chosen in symmetric sets (see symmetry.py) need a keypoint net with a turn
+        classifier: it picks which 3D keypoint each heatmap shows, and ``resolve_symmetry`` is
+        then not used. PnP is solved for every turn, and twins the view can't tell apart are
+        all reported (``PoseEstimationResult.candidates``). With ``distinctness``, the
+        classifier's choice between two twins counts only as far as the parts that differ
+        between them face the camera; with none in view they are equally likely.
         """
         self.roi_detector = roi_detector
         self.keypoint_net = keypoint_net
         self.keypoints = keypoints
+        self.symmetry = KeypointSymmetry.from_keypoints(keypoints)
+        if self.symmetry is not None and keypoint_net.num_turns != len(self.symmetry.turns):
+            raise ValueError("Keypoints in symmetric sets need a keypoint net with a turn classifier.")
+        self.distinctness = distinctness if self.symmetry is not None else None
+        self._compose = compose_table(self.symmetry.turns) if self.symmetry is not None else None
         self.object_points = np.stack(
             [kp.position for kp in keypoints], axis=0
         ).astype(np.float32)
@@ -113,6 +157,7 @@ class PoseEstimator:
         resolve_symmetry: bool = True,
         max_rotation_disagreement: float | None = None,
         min_keypoint_confidence: float | None = None,
+        distinctness: TurnDistinctness | None = None,
     ) -> "PoseEstimator":
         if keypoint_run_dir is not None:
             if keypoint_net_path is not None or keypoints_path is not None:
@@ -131,11 +176,13 @@ class PoseEstimator:
             keypoints = load_canonical_keypoints(keypoints_path)
         elif keypoints_path is not None:
             raise ValueError("Provide only one of keypoints or keypoints_path.")
+        symmetry = KeypointSymmetry.from_keypoints(keypoints)
         return cls(
             roi_detector=ROIDetector.load(roi_detector_path, input_size=roi_input_size),
             keypoint_net=KeypointHeatmapNet.load(
                 keypoint_net_path,
                 num_keypoints=len(keypoints),
+                num_turns=len(symmetry.turns) if symmetry is not None else 0,
             ),
             keypoints=keypoints,
             camera_intrinsics=camera_intrinsics,
@@ -146,6 +193,7 @@ class PoseEstimator:
             resolve_symmetry=resolve_symmetry,
             max_rotation_disagreement=max_rotation_disagreement,
             min_keypoint_confidence=min_keypoint_confidence,
+            distinctness=distinctness,
         )
 
     @classmethod
@@ -172,6 +220,11 @@ class PoseEstimator:
             resolve_symmetry=bool(config.get("resolve_symmetry", True)),
             max_rotation_disagreement=config.get("max_rotation_disagreement"),
             min_keypoint_confidence=config.get("min_keypoint_confidence"),
+            distinctness=(
+                TurnDistinctness.load(distinctness_path)
+                if (distinctness_path := run_dir / "keypoints" / TURN_DISTINCTNESS_FILENAME).is_file()
+                else None
+            ),
         )
 
     def with_camera(
@@ -239,10 +292,18 @@ class PoseEstimator:
 
         box = crop_box(roi, height, width)
         crop = crop_and_resize(image, box, self.crop_size)
-        cells, confidence, rotation = self.keypoint_net.inference(
-            crop.unsqueeze(0),
-            threshold=self.peak_threshold,
-        )
+        turn_probabilities = None
+        if self.symmetry is not None:
+            cells, confidence, rotation, turn_probs = self.keypoint_net.inference_with_turns(
+                crop.unsqueeze(0),
+                threshold=self.peak_threshold,
+            )
+            turn_probabilities = turn_probs[0].cpu().numpy().astype(np.float64)
+        else:
+            cells, confidence, rotation = self.keypoint_net.inference(
+                crop.unsqueeze(0),
+                threshold=self.peak_threshold,
+            )
         stride = self.keypoint_net.stride
         image_points = crop_to_image(
             cells[0].cpu().numpy(),
@@ -259,13 +320,16 @@ class PoseEstimator:
             image_points=image_points,
             confidence=confidence,
         )
-        pose, inliers = self._solve_pose(image_points, confidence, max_error)
+        allocentric = rotation[0].cpu().numpy()
+        if self.symmetry is not None:
+            pose, inliers, allocentric = self._solve_turns(image_points, confidence, max_error, turn_probabilities, allocentric, result)
+        else:
+            pose, inliers = self._solve_pose(image_points, confidence, max_error)
         if pose is None:
             result.rejected = "too few keypoints"
             return result
 
-        allocentric = rotation[0].cpu().numpy()
-        if self.resolve_symmetry:
+        if self.symmetry is None and self.resolve_symmetry:
             pose = self._resolve_symmetry(pose, allocentric)
         result.inliers = int(inliers.sum())
         result.keypoint_confidence = float(confidence[inliers].mean())
@@ -330,6 +394,48 @@ class PoseEstimator:
         relative = pose.quaternion.to_rotation_matrix().T @ coarse
         return float(np.degrees(np.arccos(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0))))
 
+    def _solve_turns(
+        self,
+        image_points: np.ndarray,
+        confidence: np.ndarray,
+        max_error: float,
+        turn_probabilities: np.ndarray,
+        coarse: np.ndarray,
+        result: PoseEstimationResult,
+    ) -> tuple[Pose | None, np.ndarray | None, np.ndarray]:
+        """
+        Keypoints in symmetric sets: PnP under every turn (heatmap j shows keypoint
+        permutation[turn, j]), each turn weighted by the classifier. Fills ``result``'s turn
+        fields and returns the likeliest pose, its inliers and the coarse rotation in its frame.
+        """
+        solved = {}
+        for turn in range(len(turn_probabilities)):
+            pose, inliers = self._solve_pose(
+                image_points, confidence, max_error, self.object_points[self.symmetry.permutation[turn]]
+            )
+            if pose is not None:
+                solved[turn] = (pose, inliers)
+        if not solved:
+            return None, None, coarse
+        probabilities = np.asarray(turn_probabilities, dtype=np.float64).copy()
+        if self.distinctness is not None:
+            # Trust the classifier's choice between turn g's twins only as far as the parts that
+            # differ under g face the camera: none of them, and the twins are equally likely.
+            best = solved[max(solved, key=lambda turn: probabilities[turn])][0]
+            informativeness = self.distinctness.informativeness(best.quaternion.to_rotation_matrix(), best.get_tvec())
+            for g in range(1, len(informativeness)):
+                even = 0.5 * (probabilities + probabilities[self._compose[:, g]])
+                probabilities = informativeness[g] * probabilities + (1.0 - informativeness[g]) * even
+        total = sum(probabilities[turn] for turn in solved)
+        order = sorted(solved, key=lambda turn: -probabilities[turn])
+        result.hypotheses = [
+            TurnHypothesis(int(turn), float(probabilities[turn] / total), solved[turn][0]) for turn in order
+        ]
+        best = order[0]
+        result.turn, result.turn_confidence = int(best), result.hypotheses[0].probability
+        # The coarse rotation is in the heatmaps' labelling; turn it back to the true one.
+        return solved[best][0], solved[best][1], coarse @ self.symmetry.turns[best]
+
     @staticmethod
     def _resolve_symmetry(pose: Pose, allocentric: np.ndarray) -> Pose:
         """
@@ -354,16 +460,18 @@ class PoseEstimator:
         image_points: np.ndarray,
         confidence: np.ndarray,
         max_error: float,
+        object_points: np.ndarray | None = None,
     ) -> tuple[Pose | None, np.ndarray | None]:
         """
         RANSAC PnP; keypoints reprojecting more than ``max_error`` px away are outliers.
+        ``object_points[j]`` is the 3D keypoint heatmap j shows (default: keypoint j).
         Returns the pose and the inlier mask over all keypoints.
         """
         valid = confidence >= self.peak_threshold
         if int(valid.sum()) < _MIN_PNP_INLIERS:
             return None, None
 
-        object_points = self.object_points[valid]
+        object_points = (self.object_points if object_points is None else object_points)[valid]
         points_2d = image_points[valid].reshape(-1, 1, 2).astype(np.float32)
         dist_coeffs = as_dist_coeffs(self.distortion_coeffs)
         success, rvec, tvec, _ = cv2.solvePnPRansac(

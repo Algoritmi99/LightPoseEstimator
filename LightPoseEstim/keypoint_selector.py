@@ -19,6 +19,10 @@ class CanonicalKeypoint:
     semantic_label: Optional[str] = None
     visibility_prior: Optional[float] = None
     stability_prior: Optional[float] = None
+    # Keypoints chosen in symmetric sets (select_symmetric_keypoints): the set, and the index of
+    # the turn (symmetry.TURNS) that maps the set's base point here. None otherwise.
+    orbit: Optional[int] = None
+    turn: Optional[int] = None
 
 
 KEYPOINTS_SUBDIR = "keypoints"
@@ -110,6 +114,10 @@ def save_canonical_keypoints(
         dtype=np.float32,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
+    extra = {}
+    if keypoints and all(kp.orbit is not None for kp in keypoints):
+        extra["orbits"] = np.array([kp.orbit for kp in keypoints], dtype=np.int32)
+        extra["turns"] = np.array([kp.turn for kp in keypoints], dtype=np.int32)
     np.savez(
         path,
         positions=positions,
@@ -117,6 +125,7 @@ def save_canonical_keypoints(
         semantic_labels=semantic_labels,
         visibility_prior=visibility_prior,
         stability_prior=stability_prior,
+        **extra,
     )
     logging.info("Saved %d canonical keypoints to %s", len(keypoints), path)
     return path
@@ -133,6 +142,8 @@ def load_canonical_keypoints(path: str | Path) -> list[CanonicalKeypoint]:
         stability_prior = (
             data["stability_prior"] if "stability_prior" in data else None
         )
+        orbits = data["orbits"] if "orbits" in data else None
+        turns = data["turns"] if "turns" in data else None
 
     keypoints: list[CanonicalKeypoint] = []
     for i in range(len(positions)):
@@ -153,6 +164,8 @@ def load_canonical_keypoints(path: str | Path) -> list[CanonicalKeypoint]:
                 semantic_label=label,
                 visibility_prior=vis,
                 stability_prior=stab,
+                orbit=None if orbits is None else int(orbits[i]),
+                turn=None if turns is None else int(turns[i]),
             )
         )
     return keypoints
@@ -282,6 +295,109 @@ class MeshKeypointSelector:
                 )
             )
         del occluder
+        return output
+
+    def select_symmetric_keypoints(
+        self,
+        mesh: trimesh.Trimesh,
+        orbit_count: int,
+        turns: Optional[np.ndarray] = None,
+        max_snap: float = 0.006,
+        min_normal_agreement: float = 0.7,
+        min_separation: float = 0.08,
+    ) -> list[CanonicalKeypoint]:
+        """
+        ``orbit_count`` sets of ``len(turns)`` keypoints that the object's near-symmetries map
+        onto each other (see symmetry.py): a surface point and its turned copies, each snapped
+        onto the surface. A set is kept only if every copy has a real counterpart: within
+        ``max_snap`` (m) of the surface, facing as the turned normal does, and all members at
+        least ``min_separation`` of the mesh scale apart (so none sits on a symmetry axis).
+        Sets are scored like single keypoints (each member's visibility, distinctiveness,
+        geometry, stability) and chosen for score and spread. Keypoint 4*o + g is set o's
+        member under turn g.
+        """
+        from .symmetry import TURNS
+
+        turns = TURNS if turns is None else np.asarray(turns, dtype=np.float64)
+        if orbit_count <= 0:
+            raise ValueError("orbit_count must be > 0")
+        base = self._sample_candidates(mesh, self.candidate_count)
+        members = [base.points]
+        normals = [base.normals]
+        valid = np.ones(len(base.points), dtype=bool)
+        with self._quiet_trimesh_logs():
+            for turn in turns[1:]:
+                closest, distance, triangle = trimesh.proximity.closest_point(mesh, base.points @ turn.T)
+                normal = mesh.face_normals[triangle]
+                agreement = np.einsum("ij,ij->i", normal, base.normals @ turn.T)
+                valid &= (distance <= max_snap) & (agreement >= min_normal_agreement)
+                members.append(closest)
+                normals.append(normal)
+        points = np.stack(members, axis=1)                       # [N, G, 3]
+        member_normals = np.stack(normals, axis=1)
+        separation = min_separation * max(float(mesh.scale), 1e-6)
+        pairwise = np.linalg.norm(points[:, :, None] - points[:, None, :], axis=3)
+        pairwise[:, np.arange(len(turns)), np.arange(len(turns))] = np.inf
+        valid &= pairwise.min(axis=(1, 2)) >= separation
+        points, member_normals = points[valid], member_normals[valid]
+        orbits_found = len(points)
+        logging.info("%d of %d candidate points have symmetric counterparts.", orbits_found, len(base.points))
+        if orbits_found < orbit_count:
+            raise ValueError(f"Only {orbits_found} symmetric keypoint sets found; {orbit_count} requested.")
+
+        flat = points.reshape(-1, 3)
+        neighbor_indices = self._k_nearest_indices(flat, k=min(self.neighbor_count, len(flat) - 1))
+        pool = CandidatePool(
+            points=flat,
+            normals=self._safe_normalize(member_normals.reshape(-1, 3)),
+            neighbor_indices=neighbor_indices,
+            local_curvature=self._local_curvature(flat, neighbor_indices),
+        )
+        occluder = MeshOccluder(mesh)
+        visibility_ratio, stability_ratio = self._simulate_coverage(mesh, pool, occluder)
+        external = self._estimate_external_surface_visibility(mesh, pool, occluder)
+        del occluder
+        total = self._normalize(
+            0.30 * visibility_ratio
+            + 0.20 * external
+            + 0.20 * self._compute_distinctiveness(pool)
+            + 0.15 * self._compute_geometric_usefulness(pool, mesh)
+            + 0.15 * stability_ratio
+        )
+        group = len(turns)
+        member_ok = (visibility_ratio >= self.min_visibility) & (external >= self.min_external_visibility)
+        orbit_ok = member_ok.reshape(-1, group).all(axis=1)
+        if orbit_ok.sum() < orbit_count:
+            orbit_ok[:] = True
+        quality = total.reshape(-1, group).mean(axis=1)
+        quality[~orbit_ok] = -np.inf
+
+        # Greedy: best set first, then the set whose members are farthest from those chosen.
+        chosen = [int(np.argmax(quality))]
+        nearest = np.linalg.norm(points[:, :, None] - points[chosen[0]][None, None], axis=3).min(axis=(1, 2))
+        while len(chosen) < orbit_count:
+            objective = 0.7 * self._normalize(nearest) + 0.3 * self._normalize(np.where(np.isfinite(quality), quality, 0.0))
+            objective[~orbit_ok] = -np.inf
+            objective[chosen] = -np.inf
+            nxt = int(np.argmax(objective))
+            chosen.append(nxt)
+            nearest = np.minimum(nearest, np.linalg.norm(points[:, :, None] - points[nxt][None, None], axis=3).min(axis=(1, 2)))
+
+        visibility = visibility_ratio.reshape(-1, group)
+        stability = stability_ratio.reshape(-1, group)
+        output: list[CanonicalKeypoint] = []
+        for orbit, index in enumerate(chosen):
+            for g in range(group):
+                output.append(
+                    CanonicalKeypoint(
+                        keypoint_id=len(output),
+                        position=points[index, g].copy(),
+                        visibility_prior=float(visibility[index, g]),
+                        stability_prior=float(stability[index, g]),
+                        orbit=orbit,
+                        turn=g,
+                    )
+                )
         return output
 
     def show_keypoints(
