@@ -12,6 +12,148 @@ pip install -r requirements.txt
 
 Place datasets under `data/` (ignored by git).
 
+## How to: estimate the target's pose in a navigation loop (Python)
+
+`PoseEstimator.track` is the one call a navigation loop needs. Load a trained run once with the
+camera's calibration, then call `track` for every camera frame, in order. Each call converts a
+raw sensor frame if needed, estimates the frame's pose (one network pass, quality checks
+included) and updates the estimator's twin tracker. That tracker settles, over the frames, which
+way round the near-symmetric target is: it looks almost the same turned 180 degrees, so a single
+frame can't always tell.
+
+```python
+import torch
+from LightPoseEstim import PoseEstimator
+
+estimator = PoseEstimator.load_run(
+    "pose_estimator_astrobee_sym3_30",  # trained run directory
+    camera_intrinsics=K,                # 3x3 camera matrix, as in camera_intrinsics.json
+    distortion_coeffs=D,                # OpenCV distortion coefficients
+    bayer_pattern="BG",                 # only for a camera that delivers its raw sensor mosaic
+    device=torch.device("cpu"),
+)
+
+while True:
+    frame, timestamp = camera.read()    # 2-D array, image file path or PIL image; seconds
+    tracked = estimator.track(frame, timestamp)
+    if tracked.position is not None:    # metres, camera frame
+        ...
+    if tracked.attitude is not None:    # rotation, object to camera frame
+        ...
+```
+
+What `tracked` holds:
+
+- `position`: the target's position whenever the frame gives a pose, also before the twin is
+  settled, since the twins share it.
+- `attitude`: the target's rotation (a `Quaternion`), only once the twin is settled
+  (`resolved`). Before that it is None and `candidates` lists every twin still possible.
+- `pose` is None when the frame gave no pose; `frame.rejected` says why.
+- `measured` is False when this frame missed the reported twin: its attitude is then the
+  previous one, while `position` is this frame's.
+
+Notes:
+
+- Call `track` on every frame of one continuous stream, frames without the target included.
+  `reset_tracking()` starts over, e.g. after the target was out of view for long. For unrelated
+  single images use `estimate`.
+- One estimator object follows one stream. `estimator.with_camera(K, D, bayer_pattern)` makes
+  another, with its own stream, for a second camera.
+- Expected accuracy, measured on 15 held-out approaches from about 3 m to 0.4 m (Godot renders,
+  frames 0.4 s apart): a pose on 90% of frames and an attitude on 74%, 0.1% of the attitudes on
+  the wrong twin. Position error 1.8% of the distance (median) and 3.9% (90th percentile);
+  attitude error 2.8 degrees (median) and 6.1 degrees (90th percentile). Real camera images may
+  do worse.
+
+## How to: estimate the target's pose in a navigation loop (C++)
+
+`LightPoseEstimlib` runs the same pipeline on the payload without Python: the two networks from
+an export of the trained run, everything around them in C++. As in Python, `PoseEstimator::track`
+is the one call a navigation loop needs. Construct the estimator once, then call `track` for every
+camera frame, in order. Each call converts a raw sensor frame if needed, estimates the frame's
+pose (quality checks included) and updates the estimator's twin tracker, which settles over the
+frames which way round the near-symmetric target is.
+
+1. Export the trained run once, in Python, with the payload camera's calibration. The export holds
+   compiled machine code for one device type and CPU: CPU exports need AVX2 by default; for
+   another architecture (e.g. ARM) export on that architecture with `cpu_target="native"`.
+
+   ```python
+   PoseEstimator.load_run(
+       "pose_estimator_astrobee_sym3_30",  # trained run directory
+       camera_intrinsics=K,                # 3x3 camera matrix, as in camera_intrinsics.json
+       distortion_coeffs=D,                # OpenCV distortion coefficients
+       bayer_pattern="BG",                 # only for a camera that delivers its raw sensor mosaic
+   ).export("export_sym3_cpu", device="cpu")
+   ```
+
+2. Build the library against LibTorch of the same PyTorch version as the export (it records the
+   version, and the library refuses another), with Eigen3, OpenCV 4.5.3 or later and nlohmann_json:
+
+   ```bash
+   cmake -S LightPoseEstimlib -B LightPoseEstimlib/build -DCMAKE_BUILD_TYPE=Release \
+       -DCMAKE_PREFIX_PATH=$(python -c "import torch; print(torch.utils.cmake_prefix_path)")
+   cmake --build LightPoseEstimlib/build -j 8
+   ```
+
+   and link it into the navigation software's CMake project:
+
+   ```cmake
+   add_subdirectory(path/to/LightPoseEstimlib LightPoseEstimlib)  # build dir needed when outside the project
+   target_link_libraries(navigation PRIVATE LightPoseEstimLib)
+   ```
+
+3. Call it in the loop:
+
+   ```cpp
+   #include "PoseEstimator.h"
+
+   PoseEstimator estimator("export_sym3_cpu");          // throws if the export doesn't fit this LibTorch
+   cv::Mat frame;                                       // 8-bit: BGR, grayscale, or the raw mosaic (1 channel)
+   double timestamp;                                    // seconds
+   while (camera.read(frame, timestamp)) {
+       const TrackedPose tracked = estimator.track(frame, timestamp);
+       if (const auto position = tracked.position()) {  // Eigen::Vector3d, metres, camera frame
+           ...
+       }
+       if (const auto attitude = tracked.attitude()) {  // Quaternion (qx, qy, qz, qw), object to camera frame
+           ...
+       }
+   }
+   ```
+
+What `tracked` holds, as in Python:
+
+- `position()`: the target's position whenever the frame gives a pose, also before the twin is
+  settled, since the twins share it.
+- `attitude()`: the target's rotation, only once the twin is settled (`resolved`). Before that it
+  is empty and `candidates` lists every twin still possible.
+- `pose` is empty when the frame gave no pose; `frame->rejected` says why.
+- `measured` is false when this frame missed the reported twin: its attitude is then the previous
+  one, while `position()` is this frame's.
+
+Notes:
+
+- Call `track` on every frame of one continuous stream, frames without the target included.
+  `resetTracking()` starts over, e.g. after the target was out of view for long. For unrelated
+  single images use `estimate`; `estimateTracked` is as in Python.
+- One estimator follows one stream and is not thread-safe: use one per camera and thread.
+  `setCamera(K, D, bayerPattern)` switches to a camera other than the exported one and starts the
+  stream over. A frame in RGB order instead of OpenCV's BGR: `track(frame, timestamp, false)`.
+- CPU threads: `at::set_num_threads(n)`, and `OMP_NUM_THREADS=n` in the environment (the
+  networks' kernels run on the system OpenMP runtime). On a desktop CPU (AMD Ryzen 9 9950X3D) a
+  `track` call took 6 ms (median) with 4 or 8 threads; a payload CPU will be slower.
+- The accuracy is Python's (see above). `LightPoseEstimlib/check_against_python.py` compares the
+  library with Python frame by frame. On the 7 held-out test approaches (1,584 frames) it gave the
+  same result on every frame with the same exported networks. Against the PyTorch networks, 94% of
+  poses agreed within 0.1 degrees and the twin always; the rest differ by about the method's own
+  error, where RANSAC settles on another inlier set. On raw Bayer frames the OpenCV versions
+  convert the mosaic one grey level apart on many pixels (5.0 in Python, 4.10 here), which moved
+  poses by 0.04 degrees (median).
+- `main`, built with the library, runs an export on image files and prints one JSON line per
+  frame (`--track` for a stream, `--camera`, `--bayer`): a quick check on the payload itself.
+  The export's own README.md spells out every step of the pipeline.
+
 ## Visualize ROI
 
 ```bash
@@ -121,7 +263,8 @@ with their turned twins, and PnP returned poses flipped by 180 degrees. With the
   pairs each heatmap with the 3D keypoint it then shows. It replaces the coarse-rotation symmetry
   correction.
 
-Runs trained this way can't be exported yet (the C++ library doesn't handle the classifier).
+`PoseEstimator.export` writes such runs for the C++ library, which runs the classifier, the twins and
+the tracking as Python does.
 
 Some views can't tell twins apart at all: the Astrobee's two propulsion modules are the same part
 turned 180 degrees about the vertical axis, so only its front and back differ under that turn,
@@ -144,36 +287,9 @@ candidates until it is), and `tracking.smooth_turns` offline over a whole record
 including how many frames were resolved on the wrong twin, the mistake a docking controller can't
 absorb.
 
-#### On the payload
-
-`PoseEstimator.track(frame, timestamp)` is the one call a navigation loop needs: call it for every
-camera frame of the stream, in order. It estimates the frame (one network pass, quality checks
-included) and keeps a `TurnTracker` that settles which twin the target is.
-
-```python
-estimator = PoseEstimator.load_run(run_dir, camera_intrinsics, distortion_coeffs, bayer_pattern="BG")
-while True:
-    frame, timestamp = camera.read()   # raw mosaic as a 2-D array, a path or a PIL image
-    tracked = estimator.track(frame, timestamp)
-    if tracked.position is not None:   # metres, camera frame; valid whether the twin is settled or not
-        ...
-    if tracked.attitude is not None:   # object-to-camera rotation, once the twin is settled
-        ...
-```
-
-- `pose` is None when the frame gives no pose and `frame.rejected` says why (9.5% of frames on the
-  held-out approaches: rotation disagreement, too few keypoints, low keypoint confidence).
-- `position` holds whenever there is a pose: twins differ by a turn about the object's centre, so
-  they share it. On the held-out approaches unsettled and even wrong-twin poses had the same
-  position error as settled ones, about 1.7% of the distance (median).
-- `attitude` is given once the twin is `resolved` (73.7% of frames on the held-out approaches, 2 of
-  them on the wrong twin); until then `candidates` lists the twins in play.
-- `measured` is False when the frame solved no pose for the reported twin, whose attitude is then
-  its last one (0.2% of poses); `position` then comes from the frame's own estimate.
-- `reset_tracking()` starts over, e.g. after the target was out of view for long;
-  `reset_tracking(frame_interval=..., reset_after=...)` also sets the tracker's timing.
-- Leave out `bayer_pattern` for a camera that delivers grayscale or colour images. Each camera made
-  with `with_camera` keeps its own stream.
+On the payload, `PoseEstimator.track` runs the estimator and a `TurnTracker` together, one frame
+per call: see the how-tos for [Python](#how-to-estimate-the-targets-pose-in-a-navigation-loop-python)
+and [C++](#how-to-estimate-the-targets-pose-in-a-navigation-loop-c).
 
 `estimate_tracked(image, last_pose)` instead takes the pose from the caller, e.g. a navigation
 filter's prediction for this frame. Of the twins PnP solves it returns the one continuing

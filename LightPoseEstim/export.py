@@ -18,9 +18,11 @@ from torch.export import Dim
 
 from .projection import max_valid_radius
 
-EXPORT_FORMAT_VERSION = 1
+EXPORT_FORMAT_VERSION = 2
 MANIFEST_NAME = "pose_estimator.json"
 README_NAME = "README.md"
+# Keypoints in symmetric sets: where the object differs from its turned twins (TurnDistinctness).
+DISTINCTNESS_NAME = "turn_distinctness.json"
 ENTRY_POINT = "forward"
 _VERIFY_TOLERANCE = 1e-3
 # CPU packages are machine code. Inductor builds for the exporting machine (-march=native)
@@ -107,12 +109,9 @@ def export_pose_estimator(
 ) -> Path:
     """See PoseEstimator.export."""
     from . import pose_estimator as pe
+    from . import tracking
 
-    if getattr(estimator, "symmetry", None) is not None:
-        raise NotImplementedError(
-            "Runs with keypoints in symmetric sets (train.py --symmetric-keypoints) can't be "
-            "exported yet: the C++ library doesn't handle the keypoint net's turn classifier."
-        )
+    symmetry = getattr(estimator, "symmetry", None)
     out = Path(out_dir)
     device = torch.device(device) if device is not None else estimator.device
     cpu_target = cpu_target or _default_cpu_target(device)
@@ -174,6 +173,31 @@ def export_pose_estimator(
 
     distortion = None if estimator.distortion_coeffs is None else np.asarray(estimator.distortion_coeffs, dtype=np.float64).reshape(-1)
     fold_radius = max_valid_radius(distortion)
+    keypoint_outputs = [
+        {"name": "heatmap_logits", "shape": [1, num_keypoints, heatmap_size, heatmap_size], "dtype": "float32"},
+        {"name": "rotation_6d", "shape": [1, 6], "dtype": "float32"},
+    ]
+    symmetric = None
+    if symmetry is not None:
+        keypoint_outputs.append({"name": "turn_logits", "shape": [1, len(symmetry.turns)], "dtype": "float32"})
+        distinctness = estimator.distinctness
+        if distinctness is not None:
+            # Full precision: the classifier's weight between twins depends on these.
+            (out / DISTINCTNESS_NAME).write_text(json.dumps({
+                "points": np.asarray(distinctness.points, dtype=np.float64).tolist(),
+                "normals": np.asarray(distinctness.normals, dtype=np.float64).tolist(),
+                "differs": np.asarray(distinctness.differs, dtype=bool).astype(int).tolist(),
+                "distinct_range": [float(v) for v in distinctness.distinct_range],
+            }) + "\n")
+        symmetric = {
+            "turns": [np.rint(turn).astype(int).tolist() for turn in symmetry.turns],
+            "permutation": np.asarray(symmetry.permutation, dtype=int).tolist(),
+            "compose": np.asarray(estimator._compose, dtype=int).tolist(),
+            "distinctness": None if distinctness is None else DISTINCTNESS_NAME,
+            "candidate_min_probability": pe.CANDIDATE_MIN_PROBABILITY,
+        }
+    # The estimator's own tracker settings (reset_tracking), over the defaults.
+    tracker = tracking.TurnTracker(**estimator._tracker_settings)
     manifest = {
         "format_version": EXPORT_FORMAT_VERSION,
         "torch_version": torch.__version__,
@@ -189,10 +213,7 @@ def export_pose_estimator(
             "keypoint_net": {
                 "package": keypoint_package.relative_to(out).as_posix(),
                 "input": {"name": "crop", "shape": [1, 3, crop_size, crop_size], "dtype": "float32"},
-                "outputs": [
-                    {"name": "heatmap_logits", "shape": [1, num_keypoints, heatmap_size, heatmap_size], "dtype": "float32"},
-                    {"name": "rotation_6d", "shape": [1, 6], "dtype": "float32"},
-                ],
+                "outputs": keypoint_outputs,
             },
         },
         "keypoints": {
@@ -203,6 +224,7 @@ def export_pose_estimator(
             "intrinsics": np.asarray(estimator.camera_intrinsics, dtype=np.float64).tolist(),
             "distortion_coeffs": None if distortion is None else distortion.tolist(),
             "max_valid_radius": None if not np.isfinite(fold_radius) else round(float(fold_radius), 6),
+            "bayer_pattern": estimator.bayer_pattern,
         },
         "crop_size": crop_size,
         "heatmap_stride": stride,
@@ -214,10 +236,27 @@ def export_pose_estimator(
             "ransac_iterations": 100,
             "ransac_confidence": 0.99,
         },
-        "resolve_symmetry": bool(estimator.resolve_symmetry),
+        "resolve_symmetry": bool(estimator.resolve_symmetry) and symmetry is None,
         "symmetry_turns": [turn.astype(int).tolist() for turn in pe._SYMMETRY_TURNS],
+        "symmetric_keypoints": symmetric,
         "max_rotation_disagreement_deg": estimator.max_rotation_disagreement,
         "min_keypoint_confidence": estimator.min_keypoint_confidence,
+        "continuity": {
+            "max_rotation_change_deg": pe.DEFAULT_MAX_ROTATION_CHANGE,
+            "max_translation_change": pe.DEFAULT_MAX_TRANSLATION_CHANGE,
+        },
+        "tracking": {
+            "temperature": tracker.temperature,
+            "commit_margin": tracker.commit_margin,
+            "belief_cap": tracker.belief_cap,
+            "gate_deg": tracker.gate_deg,
+            "max_gate_deg": tracking.MAX_GATE_DEG,
+            "missing_evidence": tracking.MISSING_EVIDENCE,
+            "max_missed": tracking.MAX_MISSED,
+            "frame_interval": tracker.frame_interval,
+            "reset_after": tracker.reset_after,
+            "candidate_min_probability": pe.CANDIDATE_MIN_PROBABILITY,
+        },
         "verification": verification,
     }
     (out / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2) + "\n")
@@ -246,6 +285,88 @@ closest to the full-precision reference (as in `verification`), turn it off once
 """
 
 
+def _symmetric_readme(m: dict) -> str:
+    sym = m["symmetric_keypoints"]
+    if sym is None:
+        return ""
+    g = len(sym["turns"])
+    distinct = sym["distinctness"]
+    blend = (
+        f"""   If `distinctness` is given (`{distinct}`: surface samples `P_i` with normals `N_i` in the
+   object frame, `differs[g][i]`, `distinct_range = [low, high]`): take the solved turn with the
+   largest `p` (the lowest index on ties), its pose `(R, t)` with `t` rounded to float32, and for
+   each sample `Q_i = R P_i + t`, `n_i = R N_i`, `f_i = max(0, n_i . (-Q_i / |Q_i|))`. For each turn
+   `share_g = sum_i differs[g][i] f_i / max(sum_i f_i, 1e-12)`,
+   `x = clamp((share_g - low) / (high - low), 0, 1)`, `info_g = x^2 (3 - 2x)`; `info_0 = 1`. Then
+   for `g = 1 .. {g - 1}` in order, update every `p_h` from the previous values:
+   `p_h <- info_g p_h + (1 - info_g) (p_h + p_compose[h][g]) / 2`. (The classifier's choice
+   between twins counts only as far as the parts that differ between them face the camera.)"""
+        if distinct else "   No `distinctness` was exported: use the probabilities as they are."
+    )
+    return f"""
+## Keypoints in symmetric sets
+
+The object looks almost the same after each of the {g} turns in `symmetric_keypoints.turns`
+(identity first), and its keypoints come in sets those turns map onto each other. The heatmaps
+may show any of the {g} labellings; the keypoint network's third output `turn_logits` `[1, {g}]`
+says which. Steps 7 to 9 become:
+
+7. **PnP per turn.** For every turn `g`, PnP as in step 7 with object point
+   `keypoints.positions[permutation[g][j]]` for heatmap `j`. Drop the turns where it fails; none
+   left: no pose ("too few keypoints").
+
+8. **Turn probabilities.** `p = softmax(turn_logits)` in float32, then double.
+{blend}
+   Normalise `p` over the solved turns. The hypotheses are the solved turns sorted by `p`,
+   highest first (stable); the pose is the first one's, `turn_confidence` its `p`. Candidates are
+   the hypotheses with `p >= {sym['candidate_min_probability']}` (else the first alone); two or more
+   make the result ambiguous: twins this view can't tell apart.
+
+9. **Coarse rotation.** `R_allo @ turns[best]` (the heatmaps' labelling turned back to the
+   chosen twin) in steps 8 and 10 of the pipeline above; `resolve_symmetry` doesn't apply.
+
+**Continuity with a given last pose** (Python `estimate_tracked`, C++ `estimateTracked`): instead
+of the first hypothesis take the solved turn whose rotation is closest to the last pose's, and
+no pose ("far from last pose") if it turned more than
+`continuity.max_rotation_change_deg` ({m['continuity']['max_rotation_change_deg']}) or moved more than
+`continuity.max_translation_change` ({m['continuity']['max_translation_change']}) times the last
+distance. The checks of step 10 then apply to that twin.
+"""
+
+
+def _tracking_readme(m: dict) -> str:
+    if m["symmetric_keypoints"] is None:
+        return ""
+    t = m["tracking"]
+    return f"""
+## Following a stream
+
+Python `PoseEstimator.track`, C++ `PoseEstimator::track`: called once per frame of one
+continuous stream, in order, it settles which twin the target is (`tracking`):
+
+- **Twins.** Each frame's hypotheses continue the twins followed so far, by rotation: the
+  minimum-cost assignment (SciPy's `linear_sum_assignment`) of rotation angles, keeping pairs
+  within the gate. The gate is `min(gate_deg * sqrt(n), max_gate_deg)`
+  ({t['gate_deg']}, {t['max_gate_deg']} degrees), `n` = frames since the last frame with a pose
+  (or the time since it over `frame_interval`, if set). On the first frame every hypothesis
+  starts a twin.
+- **Evidence.** A continued twin takes the hypothesis' pose and adds
+  `log(max(p, 1e-9)) / temperature` (temperature {t['temperature']}); a twin the frame solved no pose for
+  keeps its last pose and adds `log({t['missing_evidence']}) / temperature`. A hypothesis farther than the
+  gate from every twin starts a new twin. Beliefs are then shifted so the highest is 0 and
+  floored at `-belief_cap` ({t['belief_cap']}); twins other than the likeliest that went
+  {t['max_missed']} frames without a pose are dropped.
+- **Output.** The likeliest twin's pose; probabilities `exp(b - logsumexp(b))`; resolved when
+  it leads the second by at least `commit_margin` ({t['commit_margin']}; a lone twin is not resolved);
+  candidates as above; `measured` false when the frame solved no pose for that twin.
+- Frames without a pose only widen the next gate. After `reset_after` seconds without a pose
+  (if set) it starts over.
+
+Position is valid whenever there is a pose (twins differ by a turn about the object's centre);
+the rotation once resolved.
+"""
+
+
 def _readme(m: dict) -> str:
     roi, kp, pnp = m["networks"]["roi_detector"], m["networks"]["keypoint_net"], m["pnp"]
     s, k = m["crop_size"], len(m["keypoints"]["ids"])
@@ -262,6 +383,16 @@ def _readme(m: dict) -> str:
         "   (identity first), keep the one with the largest trace((R @ T)^T @ coarse); t is unchanged."
         if m["resolve_symmetry"] else "Disabled for this run; skip."
     )
+    sym = m["symmetric_keypoints"]
+    distinct_file = f"\n- `{sym['distinctness']}`: where the object differs from its turned twins." if sym and sym["distinctness"] else ""
+    bayer = m["camera"]["bayer_pattern"]
+    raw = (
+        f"This camera delivers its raw sensor mosaic (`camera.bayer_pattern` {bayer}): convert it with\n"
+        f"`cv::cvtColor(raw, grey, cv::COLOR_Bayer{bayer}2GRAY)` first, then use the grey image as R, G and B."
+        if bayer else
+        "For a camera that delivers its raw sensor mosaic, convert it with\n"
+        "`cv::cvtColor(raw, grey, cv::COLOR_Bayer<pattern>2GRAY)` first, then use the grey image as R, G and B."
+    )
     return f"""# Exported pose estimator
 
 Exported with PyTorch {m['torch_version']} for `{m['device']}`. All values below come from
@@ -274,7 +405,7 @@ The packages contain machine code for `{m['cpu_target']['machine']}`, built for
 
 - `{roi['package']}`: ROI detector forward pass (AOTInductor package).
 - `{kp['package']}`: keypoint network forward pass (AOTInductor package).
-- `{MANIFEST_NAME}`: keypoints, camera, and every setting used below.
+- `{MANIFEST_NAME}`: keypoints, camera, and every setting used below.{distinct_file}
 
 ## Running the networks in C++
 
@@ -291,7 +422,7 @@ std::vector<at::Tensor> kp = keypoint_net.run({{crop}});     // kp[0]: heatmap l
 ```
 
 Inputs are float32 NCHW tensors, RGB (OpenCV loads BGR: convert), values in [0, 1], on the
-export device. ImageNet normalisation and the ROI detector's resize to
+export device. {raw} ImageNet normalisation and the ROI detector's resize to
 {roi['internal_input_size'][0]}x{roi['internal_input_size'][1]} happen inside the networks.
 {_tf32_note(m)}
 ## Pipeline
@@ -315,7 +446,7 @@ camera image width and height; `K`, `D` are `camera.intrinsics` and `camera.dist
 
 4. **Keypoint network.** Input `[1, 3, {s}, {s}]`. Outputs heatmap logits
    `[1, {k}, {heatmap}, {heatmap}]` (one channel per keypoint, in `keypoints.ids` order) and
-   `rotation_6d` `[1, 6]`.
+   `rotation_6d` `[1, 6]`{" (and, for keypoints in symmetric sets, `turn_logits`: see below)" if sym else ""}.
 
 5. **Peaks.** For each keypoint channel: `p = sigmoid(logits)`; `(iy, ix)` = position of the
    maximum, `confidence = p[iy, ix]`, set to 0 when below `peak_threshold`
@@ -356,7 +487,7 @@ camera image width and height; `K`, `D` are `camera.intrinsics` and `camera.dist
 
 The pose returned is `(R, t)` from step 7 (or 9). Reported alongside: number of inliers,
 keypoint confidence and rotation disagreement.
-
+{_symmetric_readme(m)}{_tracking_readme(m)}
 ## Checking a port against Python
 
 Compare intermediate values with the Python `PoseEstimator` on the same images: ROI, crop

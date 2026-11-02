@@ -17,6 +17,7 @@ add_library(LightPoseEstimLib
         pose/Quaternion.cpp
         pose/Pose.cpp
         ExportConfig.cpp
+        TurnTracker.cpp
         PoseEstimator.cpp
 )
 target_include_directories(LightPoseEstimLib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/pose)
@@ -24,6 +25,6 @@ target_link_libraries(LightPoseEstimLib
         PUBLIC Eigen3::Eigen ${TORCH_LIBRARIES} ${OpenCV_LIBS}
         PRIVATE nlohmann_json::nlohmann_json)
 
-# Runs an export on images and prints one JSON line per image.
+# Runs an export on images (one at a time, or as a stream with --track) and prints one JSON line per image.
 add_executable(main main.cpp)
 target_link_libraries(main PRIVATE LightPoseEstimLib nlohmann_json::nlohmann_json)

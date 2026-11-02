@@ -306,10 +306,14 @@ class PoseEstimator:
         - ``roi_detector/forward.pt2``, ``keypoint_net/forward.pt2``: the networks' forward
           passes compiled with torch.export + AOTInductor, for ``device`` (default: the
           estimator's). The ROI detector accepts any image size.
-        - ``pose_estimator.json``: keypoints, camera intrinsics and distortion, crop size,
-          heatmap stride, peak threshold, PnP settings, symmetry and quality checks.
+        - ``pose_estimator.json``: keypoints, camera intrinsics, distortion and Bayer pattern,
+          crop size, heatmap stride, peak threshold, PnP settings, symmetry, quality checks,
+          and the twin tracking (``track``) and continuity (``estimate_tracked``) settings.
+        - ``turn_distinctness.json`` (keypoints in symmetric sets): where the object differs
+          from its turned twins.
         - ``README.md``: each step around the networks (ROI box, crop, peak decoding, PnP,
-          checks) as formulas with these values, to reimplement as is.
+          twins, checks, tracking) as formulas with these values, to reimplement as is. The
+          C++ library LightPoseEstimlib implements them.
 
         PnP and the other geometry are not compiled. A CUDA export needs a CUDA toolkit
         (CUDA_HOME). With ``verify``, each package is loaded back and compared with the

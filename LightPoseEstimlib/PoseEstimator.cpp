@@ -129,6 +129,28 @@ std::pair<at::Tensor, at::Tensor> heatmapPeaks(const at::Tensor& heatmaps, doubl
     return {coordinates, confidence};
 }
 
+// Degrees turned, and distance moved as a share of last's distance, from last to pose
+// (_pose_change in Python; translations rounded to float32 as the Python Pose hands them out).
+std::pair<double, double> poseChange(const Pose& pose, const Pose& last) {
+    const double degrees = angleDeg(pose.getRotationMatrix() * last.getRotationMatrix().transpose());
+    const Eigen::Vector3d t = float32Tvec(pose), lastT = float32Tvec(last);
+    return {degrees, (t - lastT).norm() / std::max(lastT.norm(), 1e-9)};
+}
+
+bool withinLimits(const Pose& pose, const Pose& last, const ContinuitySettings& limits) {
+    const auto [degrees, moved] = poseChange(pose, last);
+    return degrees <= limits.maxRotationChangeDeg && moved <= limits.maxTranslationChange;
+}
+
+std::optional<int> bayerCode(const std::optional<std::string>& pattern) {
+    if (!pattern) return std::nullopt;
+    if (*pattern == "BG") return cv::COLOR_BayerBG2GRAY;
+    if (*pattern == "GB") return cv::COLOR_BayerGB2GRAY;
+    if (*pattern == "RG") return cv::COLOR_BayerRG2GRAY;
+    if (*pattern == "GR") return cv::COLOR_BayerGR2GRAY;
+    throw std::invalid_argument("Unknown Bayer pattern \"" + *pattern + "\"; expected BG, GB, RG or GR.");
+}
+
 // rotation_from_6d in Python: first two matrix columns, made orthonormal by Gram-Schmidt.
 at::Tensor rotationFrom6d(const at::Tensor& x) {
     const at::Tensor a = x.index({Slice(), Slice(0, 3)});
@@ -145,27 +167,104 @@ PoseEstimator::PoseEstimator(const std::filesystem::path& exportDir)
       roiDetector(config.roiDetectorPackage.string()),
       keyPointNet(config.keypointNetPackage.string()),
       pixelToFloat(torch::arange(256, torch::kUInt8).to(torch::kFloat32).div(255).to(device)),
-      maxValidRadius(std::numeric_limits<double>::infinity()) {
+      maxValidRadius(std::numeric_limits<double>::infinity()),
+      trackingSettings(config.tracking) {
     for (const Eigen::Vector3d& p : config.keypointPositions)
         objectPoints.emplace_back(static_cast<float>(p.x()), static_cast<float>(p.y()), static_cast<float>(p.z()));
+    if (config.symmetric) {
+        for (const std::vector<int>& shown : config.symmetric->permutation) {
+            std::vector<cv::Point3f> points;
+            for (const int keypoint : shown) points.push_back(objectPoints[keypoint]);
+            turnObjectPoints.push_back(std::move(points));
+        }
+    }
     const at::Tensor values = pixelToFloat.to(torch::kCPU).contiguous();
     pixelLut = cv::Mat(1, 256, CV_32F);
     std::memcpy(pixelLut.data, values.data_ptr<float>(), 256 * sizeof(float));
-    setCamera(config.cameraIntrinsics, config.distortionCoeffs);
+    setCamera(config.cameraIntrinsics, config.distortionCoeffs, config.bayerPattern);
 }
 
-void PoseEstimator::setCamera(const Eigen::Matrix3d& cameraIntrinsics, const std::vector<double>& distortionCoeffs) {
+void PoseEstimator::setCamera(const Eigen::Matrix3d& cameraIntrinsics, const std::vector<double>& distortionCoeffs,
+                              const std::optional<std::string>& bayerPattern) {
+    bayerToGray = bayerCode(bayerPattern);
+    config.bayerPattern = bayerPattern;
     config.cameraIntrinsics = cameraIntrinsics;
     config.distortionCoeffs = distortionCoeffs;
     cameraMatrix = toCvFloat(cameraIntrinsics);
     distCoeffs = toDistCoeffs(distortionCoeffs);
     maxValidRadius = foldRadius(distortionCoeffs);
     config.maxValidRadius = std::isfinite(maxValidRadius) ? std::optional(maxValidRadius) : std::nullopt;
+    tracker.reset();
 }
 
 PoseEstimationResult PoseEstimator::estimate(const cv::Mat& image, bool isBgr) {
-    if (image.empty()) throw std::invalid_argument("Empty image.");
-    if (image.depth() != CV_8U) throw std::invalid_argument("Expected an 8-bit image.");
+    return run(toTensor(image, isBgr), std::nullopt, config.continuity);
+}
+
+PoseEstimationResult PoseEstimator::estimate(const at::Tensor& image) {
+    return run(image, std::nullopt, config.continuity);
+}
+
+PoseEstimationResult PoseEstimator::estimateTracked(const cv::Mat& image, const std::optional<Pose>& lastPose, bool isBgr,
+                                                    const std::optional<ContinuitySettings>& limits) {
+    return run(toTensor(image, isBgr), lastPose, limits.value_or(config.continuity));
+}
+
+PoseEstimationResult PoseEstimator::estimateTracked(const at::Tensor& image, const std::optional<Pose>& lastPose,
+                                                    const std::optional<ContinuitySettings>& limits) {
+    return run(image, lastPose, limits.value_or(config.continuity));
+}
+
+TrackedPose PoseEstimator::track(const cv::Mat& image, std::optional<double> timestamp, bool isBgr) {
+    return track(toTensor(image, isBgr), timestamp);
+}
+
+TrackedPose PoseEstimator::track(const at::Tensor& image, std::optional<double> timestamp) {
+    PoseEstimationResult result = run(image, std::nullopt, config.continuity);
+    TrackedPose tracked;
+    if (!config.symmetric) {
+        // No twins to settle: the frame's pose as it is.
+        if (result.pose) {
+            tracked.pose = result.pose;
+            tracked.probability = 1.0;
+            tracked.candidates = {TurnHypothesis{0, 1.0, *result.pose}};
+            tracked.resolved = true;
+        }
+    } else {
+        if (!tracker) tracker.emplace(trackingSettings);
+        tracked = tracker->update(result, timestamp);
+    }
+    tracked.frame = std::move(result);
+    return tracked;
+}
+
+void PoseEstimator::resetTracking() {
+    tracker.reset();
+}
+
+void PoseEstimator::resetTracking(const TrackingSettings& settings) {
+    trackingSettings = settings;
+    tracker.reset();
+}
+
+at::Tensor PoseEstimator::toTensor(const cv::Mat& input, bool isBgr) const {
+    if (input.empty()) throw std::invalid_argument("Empty image.");
+    if (input.depth() != CV_8U) throw std::invalid_argument("Expected an 8-bit image.");
+    cv::Mat image = input;
+    if (bayerToGray) {
+        // The raw sensor mosaic, converted to grayscale as for training (dataloader.read_image).
+        // Into a new image: demosaicing reads neighbours, so it can't overwrite its input (nor
+        // may it change the caller's frame).
+        cv::Mat raw, grey;
+        if (input.channels() == 3)
+            cv::cvtColor(input, raw, isBgr ? cv::COLOR_BGR2GRAY : cv::COLOR_RGB2GRAY);
+        else if (input.channels() == 1)
+            raw = input;
+        else
+            throw std::invalid_argument("Expected the raw sensor mosaic as a 1-channel image.");
+        cv::cvtColor(raw, grey, *bayerToGray);
+        image = grey;
+    }
     const int rows = image.rows, cols = image.cols;
     if (!device.is_cpu()) {
         // GPU: upload the 8-bit image as it is; look values up and reorder channels there.
@@ -180,7 +279,7 @@ PoseEstimationResult PoseEstimator::estimate(const cv::Mat& image, bool isBgr) {
         const at::Tensor bytes = torch::from_blob(three.data, {rows, cols, 3}, torch::kUInt8).to(device);
         at::Tensor hwc = pixelToFloat.index_select(0, bytes.flatten().to(torch::kInt32)).view({rows, cols, 3});
         if (bgr) hwc = hwc.flip(2);
-        return estimate(hwc.permute({2, 0, 1}));
+        return hwc.permute({2, 0, 1});
     }
 
     // CPU: 8-bit planes in R, G, B order (grey repeated, alpha dropped, as PIL's convert("RGB")).
@@ -199,10 +298,11 @@ PoseEstimationResult PoseEstimator::estimate(const cv::Mat& image, bool isBgr) {
         cv::Mat plane(rows, cols, CV_32F, tensor[c].data_ptr<float>());
         cv::LUT(planes[c], pixelLut, plane);
     }
-    return estimate(tensor);
+    return tensor;
 }
 
-PoseEstimationResult PoseEstimator::estimate(const at::Tensor& input) {
+PoseEstimationResult PoseEstimator::run(const at::Tensor& input, const std::optional<Pose>& lastPose,
+                                        const ContinuitySettings& limits) {
     torch::NoGradGuard noGrad;
     const at::Tensor image = (input.dim() == 3 ? input.unsqueeze(0) : input).to(device, torch::kFloat32).contiguous();
     TORCH_CHECK(image.dim() == 4 && image.size(0) == 1 && image.size(1) == 3,
@@ -266,14 +366,16 @@ PoseEstimationResult PoseEstimator::estimate(const at::Tensor& input) {
                           static_cast<double>(std::max(box.x2 - box.x1, box.y2 - box.y1)) / static_cast<double>(size);
     const double maxError = std::max(config.pnp.minReprojectionErrorPx, config.pnp.reprojectionErrorCells * cellPx);
     std::vector<bool> inliers;
-    std::optional<Pose> pose = solvePose(imagePoints, confidence, maxError, inliers);
+    std::optional<Pose> pose = config.symmetric
+        ? solveTurns(imagePoints, confidence, maxError, outputs.at(2), allocentric, result, lastPose, limits, inliers)
+        : solvePose(imagePoints, confidence, maxError, objectPoints, inliers);
     if (!pose) {
-        result.rejected = "too few keypoints";
+        if (result.rejected.empty()) result.rejected = "too few keypoints";
         return result;
     }
 
     // 8-9. Symmetry and the evidence behind the pose.
-    if (config.resolveSymmetry) pose = resolveSymmetry(*pose, allocentric);
+    if (!config.symmetric && config.resolveSymmetry) pose = resolveSymmetry(*pose, allocentric);
     double confidenceSum = 0.0;
     for (size_t k = 0; k < numKeypoints; ++k) {
         if (!inliers[k]) continue;
@@ -288,6 +390,8 @@ PoseEstimationResult PoseEstimator::estimate(const at::Tensor& input) {
     // 10. Checks.
     if (poseOutsideFov(*pose, height, width))
         result.rejected = "outside field of view";
+    else if (lastPose && !withinLimits(*pose, *lastPose, limits))
+        result.rejected = "far from last pose";
     else if (config.maxRotationDisagreementDeg && result.rotationDisagreement > *config.maxRotationDisagreementDeg)
         result.rejected = "rotation disagreement";
     else if (config.minKeypointConfidence && result.keypointConfidence < *config.minKeypointConfidence)
@@ -327,6 +431,7 @@ PoseEstimator::Box PoseEstimator::cropBox(const Roi& roi, int64_t height, int64_
 std::optional<Pose> PoseEstimator::solvePose(const std::vector<cv::Point2f>& imagePoints,
                                              const std::vector<float>& confidence,
                                              double maxError,
+                                             const std::vector<cv::Point3f>& shown,
                                              std::vector<bool>& inliers) const {
     const auto threshold = static_cast<float>(config.peakThreshold);
     std::vector<size_t> valid;
@@ -337,7 +442,7 @@ std::optional<Pose> PoseEstimator::solvePose(const std::vector<cv::Point2f>& ima
     std::vector<cv::Point3f> object;
     std::vector<cv::Point2f> image;
     for (const size_t k : valid) {
-        object.push_back(objectPoints[k]);
+        object.push_back(shown[k]);
         image.push_back(imagePoints[k]);
     }
     cv::Mat rvec, tvec;
@@ -370,6 +475,86 @@ std::optional<Pose> PoseEstimator::solvePose(const std::vector<cv::Point2f>& ima
         for (int j = 0; j < 3; ++j)
             r(i, j) = rotation.at<double>(i, j);
     return Pose::fromRotationMatrix(r, {tvec.at<double>(0), tvec.at<double>(1), tvec.at<double>(2)});
+}
+
+std::optional<Pose> PoseEstimator::solveTurns(const std::vector<cv::Point2f>& imagePoints,
+                                              const std::vector<float>& confidence,
+                                              double maxError,
+                                              const at::Tensor& turnLogits,
+                                              Eigen::Matrix3d& allocentric,
+                                              PoseEstimationResult& result,
+                                              const std::optional<Pose>& lastPose,
+                                              const ContinuitySettings& limits,
+                                              std::vector<bool>& inliers) const {
+    const SymmetricKeypoints& symmetric = *config.symmetric;
+    const size_t turns = symmetric.turns.size();
+    // The classifier's probabilities: softmax in float32 as in Python, then double.
+    const at::Tensor softmax = turnLogits.softmax(1)[0].to(torch::kCPU, torch::kFloat32).contiguous();
+    std::vector<double> p(turns);
+    for (size_t g = 0; g < turns; ++g) p[g] = softmax.data_ptr<float>()[g];
+
+    // PnP under every turn's labelling: heatmap j shows keypoint permutation[g][j].
+    struct Solved {
+        Pose pose;
+        std::vector<bool> inliers;
+    };
+    std::vector<std::optional<Solved>> solved(turns);
+    std::vector<size_t> solvedTurns;
+    for (size_t g = 0; g < turns; ++g) {
+        std::vector<bool> turnInliers;
+        if (std::optional<Pose> pose = solvePose(imagePoints, confidence, maxError, turnObjectPoints[g], turnInliers)) {
+            solved[g] = Solved{*pose, std::move(turnInliers)};
+            solvedTurns.push_back(g);
+        }
+    }
+    if (solvedTurns.empty()) return std::nullopt;
+
+    if (symmetric.distinctness) {
+        // Trust the classifier's choice between turn g's twins only as far as the parts that
+        // differ under g face the camera: none of them, and the twins are equally likely.
+        size_t likeliest = solvedTurns.front();
+        for (const size_t g : solvedTurns)
+            if (p[g] > p[likeliest]) likeliest = g;
+        const Pose& at = solved[likeliest]->pose;
+        const std::vector<double> info = symmetric.distinctness->informativeness(at.getRotationMatrix(), float32Tvec(at));
+        for (size_t g = 1; g < turns; ++g) {
+            std::vector<double> blended(turns);
+            for (size_t h = 0; h < turns; ++h)
+                blended[h] = info[g] * p[h] + (1.0 - info[g]) * (0.5 * (p[h] + p[symmetric.compose[h][g]]));
+            p = std::move(blended);
+        }
+    }
+    double total = 0.0;
+    for (const size_t g : solvedTurns) total += p[g];
+    std::vector<size_t> order = solvedTurns;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return p[a] > p[b]; });
+    for (const size_t g : order)
+        result.hypotheses.push_back({static_cast<int>(g), p[g] / total, solved[g]->pose});
+
+    size_t best = order.front();
+    if (lastPose) {
+        // The twin continuing the last pose is the one closest to it in rotation: twins are 180
+        // degrees apart, while the true pose moves little between frames.
+        best = solvedTurns.front();
+        double closest = poseChange(solved[best]->pose, *lastPose).first;
+        for (const size_t g : solvedTurns) {
+            const double degrees = poseChange(solved[g]->pose, *lastPose).first;
+            if (degrees < closest) {
+                best = g;
+                closest = degrees;
+            }
+        }
+        if (!withinLimits(solved[best]->pose, *lastPose, limits)) {
+            result.rejected = "far from last pose";
+            return std::nullopt;
+        }
+    }
+    result.turn = static_cast<int>(best);
+    result.turnConfidence = p[best] / total;
+    inliers = solved[best]->inliers;
+    // The coarse rotation is in the heatmaps' labelling; turn it back to the chosen twin.
+    allocentric = allocentric * symmetric.turns[best];
+    return solved[best]->pose;
 }
 
 Pose PoseEstimator::resolveSymmetry(const Pose& pose, const Eigen::Matrix3d& allocentric) const {
