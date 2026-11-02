@@ -144,6 +144,46 @@ candidates until it is), and `tracking.smooth_turns` offline over a whole record
 including how many frames were resolved on the wrong twin, the mistake a docking controller can't
 absorb.
 
+#### On the payload
+
+`PoseEstimator.track(frame, timestamp)` is the one call a navigation loop needs: call it for every
+camera frame of the stream, in order. It estimates the frame (one network pass, quality checks
+included) and keeps a `TurnTracker` that settles which twin the target is.
+
+```python
+estimator = PoseEstimator.load_run(run_dir, camera_intrinsics, distortion_coeffs, bayer_pattern="BG")
+while True:
+    frame, timestamp = camera.read()   # raw mosaic as a 2-D array, a path or a PIL image
+    tracked = estimator.track(frame, timestamp)
+    if tracked.position is not None:   # metres, camera frame; valid whether the twin is settled or not
+        ...
+    if tracked.attitude is not None:   # object-to-camera rotation, once the twin is settled
+        ...
+```
+
+- `pose` is None when the frame gives no pose and `frame.rejected` says why (9.5% of frames on the
+  held-out approaches: rotation disagreement, too few keypoints, low keypoint confidence).
+- `position` holds whenever there is a pose: twins differ by a turn about the object's centre, so
+  they share it. On the held-out approaches unsettled and even wrong-twin poses had the same
+  position error as settled ones, about 1.7% of the distance (median).
+- `attitude` is given once the twin is `resolved` (73.7% of frames on the held-out approaches, 2 of
+  them on the wrong twin); until then `candidates` lists the twins in play.
+- `measured` is False when the frame solved no pose for the reported twin, whose attitude is then
+  its last one (0.2% of poses); `position` then comes from the frame's own estimate.
+- `reset_tracking()` starts over, e.g. after the target was out of view for long;
+  `reset_tracking(frame_interval=..., reset_after=...)` also sets the tracker's timing.
+- Leave out `bayer_pattern` for a camera that delivers grayscale or colour images. Each camera made
+  with `with_camera` keeps its own stream.
+
+`estimate_tracked(image, last_pose)` instead takes the pose from the caller, e.g. a navigation
+filter's prediction for this frame. Of the twins PnP solves it returns the one continuing
+`last_pose`, with the quality checks applied to that twin, or no pose ("far from last pose") if it
+turned more than `max_rotation_change` (45 degrees) or moved more than `max_translation_change`
+(15% of the distance); on the held-out approaches true poses changed by at most 18.5 degrees and
+the estimates by at most 20% of the distance between frames 0.4 s apart. It keeps whichever twin
+`last_pose` is: fed with its own poses alone, 7 of the 15 held-out approaches started on the wrong
+twin and 40% of its poses were, against 2 frames for `track`.
+
 ```bash
 python train.py --dataset full_dataset --output pose_estimator_astrobee_sym \
     --split-from pose_estimator_astrobee_full_30 --exclude-recordings 'rec_run_2026-05-22-*' \
@@ -243,7 +283,9 @@ detected by a glTF mesh at the root and `_godot_imgs` folders. The mesh is in me
 EO-1, converted from glTF's Y-up axes to the Z-up model frame; the pose frame is its bounding-box
 centre (recentred). `rec_run_*` images are named after their time stamp like the recordings layout;
 numbered sets name image N `NNNNNNNNNN.jpg` for the CSV row with Timestamp N. `*_bayer` recordings
-store the raw BG sensor mosaic and are converted to grayscale when read (`read_image`).
+store the raw BG sensor mosaic and are converted to grayscale when read (`read_image`). A
+`PoseEstimator` given the camera's `bayer_pattern` (`load_run`, `with_camera`) converts raw frames
+the same way, whether passed as paths, PIL images or 2-D arrays.
 
 ```
 full_dataset/

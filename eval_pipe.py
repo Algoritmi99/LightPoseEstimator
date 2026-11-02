@@ -6,11 +6,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 from tqdm import tqdm
 
 from LightPoseEstim import PoseEstimator, open_dataset
 from LightPoseEstim.pose import pose_errors
-from LightPoseEstim.dataloader import RecordingSplit, _get_2d_roi, read_image
+from LightPoseEstim.dataloader import RecordingSplit, _get_2d_roi
 from LightPoseEstim.kp import DEFAULT_PEAK_THRESHOLD
 from LightPoseEstim.pose_estimator import RUN_CONFIG_RELATIVE
 from LightPoseEstim.tracking import TurnTracker, smooth_turns
@@ -82,14 +83,6 @@ def parse_args():
         help="Ignore the run's calibrated pose quality checks, to compare with and without them.",
     )
     return parser.parse_args()
-
-
-def estimator_for(estimators: dict, base: PoseEstimator, row) -> PoseEstimator:
-    """Reuse the loaded nets with the camera calibration of this row's recording."""
-    key = (row["camera_intrinsics"].tobytes(), row["distortion_coeffs"].tobytes())
-    if key not in estimators:
-        estimators[key] = base.with_camera(row["camera_intrinsics"], row["distortion_coeffs"])
-    return estimators[key]
 
 
 def within(errors: tuple[float, float], args) -> bool:
@@ -234,15 +227,16 @@ def main():
         base.max_rotation_disagreement,
         base.min_keypoint_confidence,
     )
-    estimators = {}
-
     records = []
     results = []
     for idx in tqdm(indices, unit="frame"):
         row = data.iloc[idx]
-        image = read_image(row)
-        result = estimator_for(estimators, base, row).estimate(image)
-        width, height = image.size
+        # The frame's own camera: its calibration and, for raw sensor recordings, Bayer pattern.
+        pattern = row.get("bayer_pattern")
+        estimator = base.with_camera(row["camera_intrinsics"], row["distortion_coeffs"], pattern if isinstance(pattern, str) else None)
+        result = estimator.estimate(row["image"])
+        with Image.open(row["image"]) as image:
+            width, height = image.size
         gt_roi = _get_2d_roi(
             (height, width),
             loader.mesh,

@@ -26,7 +26,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.transform import Rotation
 
-from .pose import Pose
+from .pose import Pose, Quaternion
 from .pose_estimator import CANDIDATE_MIN_PROBABILITY, PoseEstimationResult, TurnHypothesis
 
 DEFAULT_TEMPERATURE = 2.0       # a frame's evidence counts 1/temperature: neighbours see nearly the same view
@@ -47,6 +47,26 @@ class TrackedPose:
     resolved: bool = False
     # False when this frame solved no pose for the likeliest twin: ``pose`` is then its last one.
     measured: bool = True
+    # This frame's own estimate (from PoseEstimator.track), e.g. why it gave no pose.
+    frame: PoseEstimationResult | None = None
+
+    @property
+    def position(self) -> np.ndarray | None:
+        """The target's position in the camera frame (metres) whenever there is a pose, settled
+        or not: the twins differ by a turn about the object's centre, so they share it (on the
+        held-out Astrobee approaches, a frame's twins lay within 0.4% of the distance of each
+        other, median). From this frame's own estimate when it solved no pose for the reported
+        twin."""
+        if self.pose is None:
+            return None
+        pose = self.frame.pose if not self.measured and self.frame is not None and self.frame.pose is not None else self.pose
+        return np.asarray(pose.get_tvec(), np.float64).ravel()
+
+    @property
+    def attitude(self) -> Quaternion | None:
+        """The target's rotation (object to camera frame) once the twin is settled
+        (``resolved``); None until then, when it may be any of ``candidates``."""
+        return self.pose.quaternion if self.resolved and self.pose is not None else None
 
 
 @dataclass

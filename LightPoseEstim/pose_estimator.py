@@ -2,6 +2,7 @@ import copy
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -16,12 +17,16 @@ from .keypoint_selector import (
     paths_from_keypoint_run_dir,
 )
 from .crop import crop_and_resize, crop_box, crop_to_image
+from .dataloader import BAYER_TO_GRAY
 from .kp.keypoint_heatmap import DEFAULT_PEAK_THRESHOLD, KeypointHeatmapNet
 from .pose import Pose
 from .projection import as_dist_coeffs, project_points, projectable_mask, ray_rotation
 from .roi import ROI, roi_to_bbox
 from .roi.roi_detector import ROI_INPUT_SIZE, ROIDetector
 from .symmetry import KeypointSymmetry, TurnDistinctness, compose_table
+
+if TYPE_CHECKING:
+    from .tracking import TrackedPose
 
 ROI_CHECKPOINT_RELATIVE = Path("roi") / "roi_detector.pth"
 RUN_CONFIG_RELATIVE = Path("config.json")
@@ -30,6 +35,9 @@ TURN_DISTINCTNESS_FILENAME = "turn_distinctness.npz"
 # Turn hypotheses at least this likely are reported as candidates; two or more make a result
 # ambiguous.
 CANDIDATE_MIN_PROBABILITY = 0.2
+# estimate_tracked: how far a frame's pose may move from the last pose.
+DEFAULT_MAX_ROTATION_CHANGE = 45.0      # degrees (a near-symmetric object's twins are 180 apart)
+DEFAULT_MAX_TRANSLATION_CHANGE = 0.15   # as a share of the target's distance
 
 # PnP outlier threshold: this many heatmap cells, mapped to full-image pixels.
 _REPROJECTION_ERROR_CELLS = 2.0
@@ -60,14 +68,17 @@ class PoseEstimationResult:
     keypoint_confidence: float = float("nan")
     rotation_disagreement: float = float("nan")
     # Why ``pose`` is None: "no target in view", "too few keypoints", "outside field of
-    # view", "rotation disagreement" or "low keypoint confidence".
+    # view", "rotation disagreement", "low keypoint confidence" or, from estimate_tracked,
+    # "far from last pose".
     rejected: str | None = None
-    # Keypoints in symmetric sets: the turn the classifier chose (index into symmetry.TURNS)
-    # and its probability.
+    # Keypoints in symmetric sets: the turn of ``pose`` (index into symmetry.TURNS; the
+    # classifier's choice, or from estimate_tracked the twin continuing the last pose) and the
+    # classifier's probability for it.
     turn: int | None = None
     turn_confidence: float = float("nan")
     # Keypoints in symmetric sets: a pose for every turn PnP could solve, likeliest first.
-    # ``pose`` is the first; ``candidates`` are those likely enough to report.
+    # ``pose`` is the first (from estimate_tracked: the one continuing the last pose);
+    # ``candidates`` are those likely enough to report.
     hypotheses: list[TurnHypothesis] = field(default_factory=list)
 
     @property
@@ -79,6 +90,32 @@ class PoseEstimationResult:
     @property
     def ambiguous(self) -> bool:
         return self.pose is not None and len(self.candidates) > 1
+
+
+def _pose_change(pose: Pose, last: Pose) -> tuple[float, float]:
+    """Degrees turned, and distance moved as a share of ``last``'s distance, from ``last`` to ``pose``."""
+    relative = pose.quaternion.to_rotation_matrix() @ last.quaternion.to_rotation_matrix().T
+    degrees = float(np.degrees(np.arccos(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0))))
+    t, t_last = np.asarray(pose.get_tvec(), np.float64).ravel(), np.asarray(last.get_tvec(), np.float64).ravel()
+    return degrees, float(np.linalg.norm(t - t_last) / max(np.linalg.norm(t_last), 1e-9))
+
+
+@dataclass
+class _Continuity:
+    """estimate_tracked's condition on a frame's pose: close enough to the last pose."""
+    last_pose: Pose
+    max_rotation_change: float
+    max_translation_change: float
+
+    def allows(self, pose: Pose) -> bool:
+        degrees, moved = _pose_change(pose, self.last_pose)
+        return degrees <= self.max_rotation_change and moved <= self.max_translation_change
+
+
+def _checked_bayer_pattern(pattern: str | None) -> str | None:
+    if pattern is not None and pattern not in BAYER_TO_GRAY:
+        raise ValueError(f"Unknown Bayer pattern {pattern!r}; expected one of {', '.join(BAYER_TO_GRAY)}.")
+    return pattern
 
 
 class PoseEstimator:
@@ -96,6 +133,7 @@ class PoseEstimator:
         max_rotation_disagreement: float | None = None,
         min_keypoint_confidence: float | None = None,
         distinctness: TurnDistinctness | None = None,
+        bayer_pattern: str | None = None,
     ):
         """
         ``resolve_symmetry`` corrects 180-degree flips with the keypoint net's coarse
@@ -112,6 +150,10 @@ class PoseEstimator:
         all reported (``PoseEstimationResult.candidates``). With ``distinctness``, the
         classifier's choice between two twins counts only as far as the parts that differ
         between them face the camera; with none in view they are equally likely.
+
+        ``bayer_pattern`` ("BG", "GB", "RG" or "GR") is for a camera delivering its raw sensor
+        mosaic: images given as paths, PIL images or 2-D arrays are converted to grayscale
+        first, as in training. Tensors are used as they are.
         """
         self.roi_detector = roi_detector
         self.keypoint_net = keypoint_net
@@ -131,6 +173,10 @@ class PoseEstimator:
         self.resolve_symmetry = resolve_symmetry
         self.max_rotation_disagreement = max_rotation_disagreement
         self.min_keypoint_confidence = min_keypoint_confidence
+        self.bayer_pattern = _checked_bayer_pattern(bayer_pattern)
+        # track()'s state: the twins followed so far (a tracking.TurnTracker) and its settings.
+        self._tracker = None
+        self._tracker_settings: dict = {}
         self.device = (
             device
             if device is not None
@@ -158,6 +204,7 @@ class PoseEstimator:
         max_rotation_disagreement: float | None = None,
         min_keypoint_confidence: float | None = None,
         distinctness: TurnDistinctness | None = None,
+        bayer_pattern: str | None = None,
     ) -> "PoseEstimator":
         if keypoint_run_dir is not None:
             if keypoint_net_path is not None or keypoints_path is not None:
@@ -194,6 +241,7 @@ class PoseEstimator:
             max_rotation_disagreement=max_rotation_disagreement,
             min_keypoint_confidence=min_keypoint_confidence,
             distinctness=distinctness,
+            bayer_pattern=bayer_pattern,
         )
 
     @classmethod
@@ -204,6 +252,7 @@ class PoseEstimator:
         distortion_coeffs: np.ndarray | None = None,
         peak_threshold: float = DEFAULT_PEAK_THRESHOLD,
         device: torch.device | None = None,
+        bayer_pattern: str | None = None,
     ) -> "PoseEstimator":
         run_dir = Path(run_dir)
         with (run_dir / RUN_CONFIG_RELATIVE).open() as handle:
@@ -225,17 +274,22 @@ class PoseEstimator:
                 if (distinctness_path := run_dir / "keypoints" / TURN_DISTINCTNESS_FILENAME).is_file()
                 else None
             ),
+            bayer_pattern=bayer_pattern,
         )
 
     def with_camera(
         self,
         camera_intrinsics: np.ndarray,
         distortion_coeffs: np.ndarray | None = None,
+        bayer_pattern: str | None = None,
     ) -> "PoseEstimator":
-        """The same networks and settings with another camera calibration."""
+        """The same networks and settings with another camera: its calibration and, if it
+        delivers its raw sensor mosaic, its Bayer pattern."""
         estimator = copy.copy(self)
         estimator.camera_intrinsics = np.asarray(camera_intrinsics, dtype=np.float32)
         estimator.distortion_coeffs = distortion_coeffs
+        estimator.bayer_pattern = _checked_bayer_pattern(bayer_pattern)
+        estimator._tracker = None       # its own stream for track()
         return estimator
 
     def export(
@@ -283,7 +337,87 @@ class PoseEstimator:
                 return results[0]
         return results
 
-    def _estimate_one(self, image: torch.Tensor) -> PoseEstimationResult:
+    def track(self, image, timestamp: float | None = None) -> "TrackedPose":
+        """
+        Call once per camera frame of a continuous stream, in order, e.g. in the navigation loop:
+        the frame's pose, with which of the object's twins it is settled over the frames so far.
+        (For unrelated images, use ``estimate``.)
+
+        Each frame is estimated as by ``estimate`` (one network pass) and handed to a
+        tracking.TurnTracker kept by this estimator, which follows every twin through the stream
+        and collects the evidence for each. The returned TrackedPose has:
+
+        - ``pose``: the likeliest twin's pose; None when there is none yet, and ``frame.rejected``
+          says why this frame gave none;
+        - ``resolved``: the twin is settled and ``pose`` can be used whole. Until then only its
+          position can: twins differ by a turn about the object's centre, so they share it, and
+          ``candidates`` lists every twin still in play;
+        - ``measured``: False when this frame solved no pose for that twin, whose pose is then
+          its last one;
+        - ``frame``: this frame's own estimate.
+
+        For navigation, ``position`` is the target's position whenever there is a pose, and
+        ``attitude`` its rotation once the twin is settled (None before).
+
+        Pass ``timestamp`` (seconds) if frames can be dropped before they get here; frames
+        without a pose need nothing special. ``reset_tracking`` starts over. A camera set with
+        ``with_camera`` comes with its own, empty stream.
+        """
+        from .tracking import TrackedPose, TurnTracker  # tracking.py imports this module
+
+        result = self._estimate_one(self._to_tensor(image))
+        if self.symmetry is None:
+            # No twins to settle: the frame's pose as it is.
+            if result.pose is None:
+                return TrackedPose(None, frame=result)
+            return TrackedPose(result.pose, 1.0, [TurnHypothesis(0, 1.0, result.pose)], True, True, result)
+        if self._tracker is None:
+            self._tracker = TurnTracker(**self._tracker_settings)
+        tracked = self._tracker.update(result, timestamp)
+        tracked.frame = result
+        return tracked
+
+    def reset_tracking(self, **tracker_settings) -> None:
+        """
+        Start ``track`` over, forgetting the frames so far (e.g. after the target was out of view
+        for long). ``tracker_settings`` go to tracking.TurnTracker, e.g. ``frame_interval``
+        (seconds between frames, to widen the gate by time after dropped frames) or
+        ``reset_after`` (seconds without a pose after which it starts over by itself), and stay
+        in effect for later resets.
+        """
+        if tracker_settings:
+            self._tracker_settings = dict(tracker_settings)
+        self._tracker = None
+
+    def estimate_tracked(
+        self,
+        image,
+        last_pose: Pose | None,
+        max_rotation_change: float = DEFAULT_MAX_ROTATION_CHANGE,
+        max_translation_change: float = DEFAULT_MAX_TRANSLATION_CHANGE,
+    ) -> PoseEstimationResult:
+        """
+        One frame of a stream (a single image), given the pose just before it: ``last_pose``,
+        the last estimate or a prediction of it (e.g. a navigation filter's). The pose returned
+        continues it: of the twins PnP solved, the one closest in rotation to ``last_pose``, with
+        the quality checks applied to that twin; or no pose ("far from last pose") if it turned
+        more than ``max_rotation_change`` degrees or moved more than ``max_translation_change``
+        times the target's distance. A frame where PnP misses that twin thus gives no pose
+        rather than another twin. Without ``last_pose`` (the first frame, or after losing the
+        target) this is ``estimate``.
+
+        The limits apply between ``last_pose`` and this frame: widen them after frames without
+        a pose, or pass a pose predicted for this frame.
+
+        Continuity keeps whichever twin ``last_pose`` is and can't tell whether that one is
+        right. Start from a settled twin (e.g. tracking.TurnTracker's pose once ``resolved``)
+        and watch ``turn_confidence``, the classifier's probability for the continued twin:
+        when it stays low, the images favour another twin and it should be settled again.
+        """
+        continuity = None if last_pose is None else _Continuity(last_pose, max_rotation_change, max_translation_change)
+        return self._estimate_one(self._to_tensor(image), continuity)
+
+    def _estimate_one(self, image: torch.Tensor, continuity: _Continuity | None = None) -> PoseEstimationResult:
         image = image.to(self.device)
         _, height, width = image.shape
         roi = self.roi_detector.inference(image.unsqueeze(0))[0]
@@ -322,11 +456,13 @@ class PoseEstimator:
         )
         allocentric = rotation[0].cpu().numpy()
         if self.symmetry is not None:
-            pose, inliers, allocentric = self._solve_turns(image_points, confidence, max_error, turn_probabilities, allocentric, result)
+            pose, inliers, allocentric = self._solve_turns(
+                image_points, confidence, max_error, turn_probabilities, allocentric, result, continuity
+            )
         else:
             pose, inliers = self._solve_pose(image_points, confidence, max_error)
         if pose is None:
-            result.rejected = "too few keypoints"
+            result.rejected = result.rejected or "too few keypoints"
             return result
 
         if self.symmetry is None and self.resolve_symmetry:
@@ -336,6 +472,8 @@ class PoseEstimator:
         result.rotation_disagreement = self.rotation_disagreement(pose, allocentric)
         if self._pose_outside_fov(pose, height, width):
             result.rejected = "outside field of view"
+        elif continuity is not None and not continuity.allows(pose):
+            result.rejected = "far from last pose"
         elif (
             self.max_rotation_disagreement is not None
             and result.rotation_disagreement > self.max_rotation_disagreement
@@ -402,11 +540,14 @@ class PoseEstimator:
         turn_probabilities: np.ndarray,
         coarse: np.ndarray,
         result: PoseEstimationResult,
+        continuity: _Continuity | None = None,
     ) -> tuple[Pose | None, np.ndarray | None, np.ndarray]:
         """
         Keypoints in symmetric sets: PnP under every turn (heatmap j shows keypoint
         permutation[turn, j]), each turn weighted by the classifier. Fills ``result``'s turn
-        fields and returns the likeliest pose, its inliers and the coarse rotation in its frame.
+        fields and returns the likeliest pose, its inliers and the coarse rotation in its frame;
+        with ``continuity``, the pose of the twin continuing the last pose instead (none, with
+        ``result.rejected`` set, if that twin moved too far).
         """
         solved = {}
         for turn in range(len(turn_probabilities)):
@@ -432,7 +573,14 @@ class PoseEstimator:
             TurnHypothesis(int(turn), float(probabilities[turn] / total), solved[turn][0]) for turn in order
         ]
         best = order[0]
-        result.turn, result.turn_confidence = int(best), result.hypotheses[0].probability
+        if continuity is not None:
+            # The twin continuing the last pose is the one closest to it in rotation: twins are
+            # 180 degrees apart, while the true pose moves little between frames.
+            best = min(solved, key=lambda turn: _pose_change(solved[turn][0], continuity.last_pose)[0])
+            if not continuity.allows(solved[best][0]):
+                result.rejected = "far from last pose"
+                return None, None, coarse
+        result.turn, result.turn_confidence = int(best), float(probabilities[best] / total)
         # The coarse rotation is in the heatmaps' labelling; turn it back to the true one.
         return solved[best][0], solved[best][1], coarse @ self.symmetry.turns[best]
 
@@ -523,10 +671,13 @@ class PoseEstimator:
             if image.ndim == 3:
                 return image.float()
             raise ValueError("Expected image tensor with shape [C, H, W].")
+        if isinstance(image, np.ndarray) and image.ndim == 3 and image.shape[0] in (1, 3):
+            return torch.from_numpy(image).float()
         if isinstance(image, (str, Path)):
-            image = Image.open(image).convert("RGB")
+            image = Image.open(image)
         elif isinstance(image, np.ndarray):
-            if image.ndim == 3 and image.shape[0] in (1, 3):
-                return torch.from_numpy(image).float()
             image = Image.fromarray(image)
-        return self.to_tensor(image)
+        if self.bayer_pattern is not None:
+            # The raw sensor mosaic, converted to grayscale as for training (dataloader.read_image).
+            image = Image.fromarray(cv2.cvtColor(np.asarray(image.convert("L")), BAYER_TO_GRAY[self.bayer_pattern]))
+        return self.to_tensor(image.convert("RGB"))
