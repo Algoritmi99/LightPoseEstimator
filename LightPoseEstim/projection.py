@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import trimesh
 
+from .devices import resolve_device
 from .pose import Pose
 
 logger = logging.getLogger(__name__)
@@ -171,11 +172,7 @@ class MeshOccluder:
         device: torch.device | None = None,
         tolerance: float | None = None,
     ):
-        self.device = (
-            device
-            if device is not None
-            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        )
+        self.device = resolve_device(device)
         triangles = torch.from_numpy(np.array(mesh.triangles, dtype=np.float32)).to(self.device)
         self.v0 = triangles[:, 0]
         self.e1 = triangles[:, 1] - triangles[:, 0]

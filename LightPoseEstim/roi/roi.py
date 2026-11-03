@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 
 import cv2
-import matplotlib.pyplot as plt
 import numpy as np
 
 
@@ -100,6 +99,8 @@ def visualize_roi(
             )
             for px, py in projected_points[in_bounds]:
                 cv2.circle(vis, (int(px), int(py)), 1, (255, 255, 0), -1)
+
+    import matplotlib.pyplot as plt  # only for plotting, so inference doesn't need it
 
     plt.figure(figsize=(8, 8))
     plt.imshow(vis)

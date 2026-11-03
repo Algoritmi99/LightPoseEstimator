@@ -7,6 +7,7 @@ import torch
 from torch import nn
 from tqdm import tqdm
 
+from ..devices import resolve_device
 from ..dataloader import ImageROIDataset, RecordingSplit, init_worker, split_by_recording
 from .roi_detector import ROIDetector
 
@@ -25,13 +26,12 @@ class ROIDetectorTrainer:
                  use_tensorboard: bool = False,
                  tensorboard_log_dir: str = "runs/roi_detector",
                  augment: bool = True,
+                 batch_augmentation: bool | None = None,
                  ):
-
-        self.device = (
-            device
-            if device is not None
-            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        )
+        """``device`` defaults to CUDA if available. ``batch_augmentation`` applies the dataset's
+        colour jitter, blur and low light to whole training batches on the device instead of to
+        each image in the loader workers; by default it does when the device is a GPU."""
+        self.device = resolve_device(device)
         self.batch_size = batch_size
         self.pin_memory = self.device.type == "cuda"
 
@@ -39,7 +39,15 @@ class ROIDetectorTrainer:
         if split is None:
             split = split_by_recording(dataset.df)
         # Augment training images only; validation measures clean images.
-        train_dataset = Subset(dataset.with_augmentation(augment), split.indices(dataset.df, "train"))
+        # The photometric part on whole training batches on the device, by default on a GPU,
+        # rather than on each image in the loader workers.
+        if batch_augmentation is None:
+            batch_augmentation = self.device.type == "cuda"
+        self.batch_augmentation = dataset.batch_augmentation if augment and batch_augmentation else None
+        train_dataset = Subset(
+            dataset.with_augmentation(augment, batch_photometric=self.batch_augmentation is not None),
+            split.indices(dataset.df, "train"),
+        )
         val_dataset = Subset(dataset.with_augmentation(False), split.indices(dataset.df, "val"))
         loader_kwargs = dict(
             batch_size=batch_size,
@@ -78,6 +86,8 @@ class ROIDetectorTrainer:
         for batch_idx, (images, rois) in enumerate(self.train_loader):
             images = images.to(self.device, non_blocking=self.pin_memory)
             rois = rois.to(self.device, non_blocking=self.pin_memory)
+            if self.batch_augmentation is not None:
+                images = self.batch_augmentation(images)
 
             predictions = self.model(images)
             loss = self.criterion(predictions, rois)

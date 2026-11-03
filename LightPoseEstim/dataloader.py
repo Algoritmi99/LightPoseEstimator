@@ -33,6 +33,8 @@ from .projection import (
 from .roi import BBox, ROI, bbox_to_roi, normalize_roi
 from .roi.roi_detector import ROI_INPUT_SIZE, resize_for_roi
 from .keypoint_selector import CanonicalKeypoint
+from .bayer import BAYER_TO_GRAY
+from .gpu_augment import BatchPhotometric
 
 logger = logging.getLogger(__name__)
 
@@ -98,15 +100,6 @@ def _find_image(image_dir: Path, timestamp, suffix: str = "") -> list[Path]:
     return []
 
 
-# OpenCV conversions of raw Bayer mosaics to grayscale, by pattern name.
-BAYER_TO_GRAY = {
-    "BG": cv2.COLOR_BayerBG2GRAY,
-    "GB": cv2.COLOR_BayerGB2GRAY,
-    "RG": cv2.COLOR_BayerRG2GRAY,
-    "GR": cv2.COLOR_BayerGR2GRAY,
-}
-
-
 def read_image(row) -> Image.Image:
     """
     RGB image of a dataset row. Rows whose ``bayer_pattern`` names a pattern hold the raw sensor
@@ -120,6 +113,55 @@ def read_image(row) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(raw, BAYER_TO_GRAY[pattern])).convert("RGB")
 
 
+def _all_channels_equal(pixels: np.ndarray) -> bool:
+    # A few rows first: a colour image almost always shows it there already.
+    sample = pixels[::16]
+    if not ((sample[..., 0] == sample[..., 1]).all() and (sample[..., 1] == sample[..., 2]).all()):
+        return False
+    return bool((pixels[..., 0] == pixels[..., 1]).all() and (pixels[..., 1] == pixels[..., 2]).all())
+
+
+def read_pixels(row) -> np.ndarray:
+    """
+    uint8 pixels of a dataset row, those ``read_image(row)`` has: [H, W] for gray images (RGB
+    files whose channels are all equal included), else [H, W, 3] RGB. PNGs are decoded with
+    OpenCV, about twice as fast as PIL on large images and the same pixels (PNG is lossless);
+    anything else, and PNGs OpenCV reads otherwise (e.g. 16-bit), with PIL as before.
+    """
+    pattern = row.get("bayer_pattern")
+    path = str(row["image"])
+    pixels = None
+    if not isinstance(pattern, str) and path.lower().endswith(".png"):
+        decoded = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if decoded is not None and decoded.dtype == np.uint8:
+            if decoded.ndim == 2:
+                pixels = decoded
+            elif decoded.shape[2] in (3, 4):
+                pixels = cv2.cvtColor(decoded, cv2.COLOR_BGRA2RGB if decoded.shape[2] == 4 else cv2.COLOR_BGR2RGB)
+    if pixels is None:
+        with Image.open(path) as image:
+            if isinstance(pattern, str):
+                return cv2.cvtColor(np.asarray(image.convert("L")), BAYER_TO_GRAY[pattern])
+            pixels = np.asarray(image) if image.mode == "L" else np.asarray(image.convert("RGB"))
+    if pixels.ndim == 3 and _all_channels_equal(pixels):
+        pixels = pixels[..., 0]
+    return pixels
+
+
+def pixels_to_tensor(pixels: np.ndarray, out: torch.Tensor | None = None) -> torch.Tensor:
+    """
+    uint8 [H, W] or [H, W, C] pixels as float [C, H, W] in [0, 1], the values torchvision's
+    ToTensor gives. ``out``, a float tensor of that shape, is filled instead of a new one: for
+    a large image, fresh memory costs more than the conversion itself.
+    """
+    # Decoded PIL pixels are read-only; torch needs a writable array (copied only if it isn't).
+    source = torch.from_numpy(np.require(pixels, requirements=("W",)))
+    source = source.unsqueeze(0) if source.ndim == 2 else source.permute(2, 0, 1)
+    if out is None:
+        out = torch.empty(source.shape, dtype=torch.float32)
+    return out.copy_(source).div_(255)
+
+
 def read_image_tensor(row) -> torch.Tensor:
     """
     Float [C, H, W] image in [0, 1] of a dataset row, with the values ``T.ToTensor()(read_image(row))``
@@ -127,20 +169,7 @@ def read_image_tensor(row) -> torch.Tensor:
     the training transforms work per channel and keep gray images gray, so ``_as_rgb`` at the
     end gives the network the same input for a third of the work.
     """
-    pattern = row.get("bayer_pattern")
-    with Image.open(row["image"]) as image:
-        if isinstance(pattern, str):
-            pixels = cv2.cvtColor(np.asarray(image.convert("L")), BAYER_TO_GRAY[pattern])
-        elif image.mode == "L":
-            pixels = np.asarray(image)
-        else:
-            pixels = np.asarray(image.convert("RGB"))
-            if (pixels[..., 0] == pixels[..., 1]).all() and (pixels[..., 1] == pixels[..., 2]).all():
-                pixels = pixels[..., 0]
-    # Decoded PIL pixels are read-only; torch needs a writable array (copied only if it isn't).
-    tensor = torch.from_numpy(np.require(pixels, requirements=("C", "W")))
-    tensor = tensor.unsqueeze(0) if tensor.ndim == 2 else tensor.permute(2, 0, 1).contiguous()
-    return tensor.to(torch.float32).div(255)
+    return pixels_to_tensor(read_pixels(row))
 
 
 def _as_rgb(image: torch.Tensor) -> torch.Tensor:
@@ -293,7 +322,12 @@ def _photometric_augmentation(
     return T.Compose(transforms)
 
 
-def _jitter_roi(roi: ROI, shift: float = 0.2, scale: float = 0.25) -> ROI:
+# _jitter_roi's limits: the ROI centre moves by up to this share of the box, its size by this share.
+JITTER_SHIFT = 0.2
+JITTER_SCALE = 0.25
+
+
+def _jitter_roi(roi: ROI, shift: float = JITTER_SHIFT, scale: float = JITTER_SCALE) -> ROI:
     """
     Random shift and scale, so training crops look like crops from a predicted ROI.
     The defaults cover the ROI detector's measured validation errors (centre off by up to
@@ -333,42 +367,72 @@ class ImageROIDataset(Dataset):
         augment: bool = False,
         input_size: tuple[int, int] = ROI_INPUT_SIZE,
         low_light: float = 0.0,
+        cache=None,
     ):
+        """``cache`` (an ``image_cache.RoiInputCache`` of ``data``) supplies the resized images
+        instead of decoding every frame each time: the same values."""
+        if cache is not None and (len(cache.sizes) != len(data) or cache.input_size != tuple(input_size)):
+            raise ValueError("The ROI input cache is for other frames or another input size.")
         self.df = data
         self.mesh = mesh
         self.margin = margin
+        self.cache = cache
         self.input_size = tuple(input_size)
         self.augment = augment
         self.low_light = low_light
         # Downscaling to the ROI input averages sensor noise away, so add less of it.
         self.photometric = _photometric_augmentation(low_light, noise=(0.002, 0.008))
+        # The same for whole batches on their device, for a trainer to apply in place of
+        # ``photometric`` (see with_augmentation).
+        self.batch_augmentation = BatchPhotometric(low_light=low_light, noise=(0.002, 0.008))
+        self.batch_photometric = False
 
-    def with_augmentation(self, augment: bool) -> "ImageROIDataset":
-        """Shallow copy sharing the loaded data, with zoom/flip/colour augmentation on or off."""
+    def with_augmentation(self, augment: bool, batch_photometric: bool = False) -> "ImageROIDataset":
+        """Shallow copy sharing the loaded data, with zoom/flip/colour augmentation on or off.
+        With ``batch_photometric``, the colour jitter, blur and low light are left to
+        ``batch_augmentation``, for the trainer to apply to whole batches."""
         dataset = copy.copy(self)
         dataset.augment = augment
+        dataset.batch_photometric = batch_photometric
         return dataset
 
     def __len__(self):
         return len(self.df)
 
+    def __getstate__(self):
+        # Each DataLoader worker gets its own conversion buffer.
+        return {**self.__dict__, "_buffer": None}
+
+    def _full_image(self, pixels: np.ndarray) -> torch.Tensor:
+        """The whole image as float [C, H, W], in a buffer reused from sample to sample: only its
+        resized copy leaves this dataset, and converting into memory already in use is far
+        cheaper than into fresh memory for a large image."""
+        shape = (1, *pixels.shape) if pixels.ndim == 2 else (pixels.shape[2], *pixels.shape[:2])
+        if getattr(self, "_buffer", None) is None or tuple(self._buffer.shape) != shape:
+            self._buffer = torch.empty(shape, dtype=torch.float32)
+        return pixels_to_tensor(pixels, self._buffer)
+
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        image = read_image_tensor(row)
+        if self.cache is not None:
+            image, (height, width) = self.cache.get(idx)
+        else:
+            pixels = read_pixels(row)
+            height, width = pixels.shape[:2]
+            image = resize_for_roi(self._full_image(pixels), self.input_size)
 
         roi = _get_2d_roi(
-            image.shape,
+            (height, width),
             self.mesh,
             row["pose"],
             row["camera_intrinsics"],
             row["distortion_coeffs"],
             self.margin,
         )
-        target = normalize_roi(
-            image.unsqueeze(0),
-            torch.tensor([roi.cx, roi.cy, roi.w, roi.h], dtype=image.dtype),
+        # As normalize_roi does for an image of this size.
+        target = torch.tensor([roi.cx, roi.cy, roi.w, roi.h], dtype=torch.float32) * torch.tensor(
+            [1 / width, 1 / height, 1 / width, 1 / height], dtype=torch.float32
         )
-        image = resize_for_roi(image, self.input_size)
         if self.augment:
             image, target = self._augment(image, target)
         return _as_rgb(image), target
@@ -397,7 +461,8 @@ class ImageROIDataset(Dataset):
             if float(torch.rand(())) < 0.5:
                 image = image.flip(-1)
                 cx = 1.0 - cx
-        image = _apply_photometric(self.photometric, image, self.low_light)
+        if not self.batch_photometric:
+            image = _apply_photometric(self.photometric, image, self.low_light)
         return image, torch.tensor([cx, cy, w, h], dtype=image.dtype)
 
 
@@ -409,22 +474,25 @@ class ImageKPHeatmapDataset(Dataset):
         keypoints: list[CanonicalKeypoint],
         margin: float = 1.4,
         heatmap_sigma: float = 2.0,
+        device=None,
     ):
+        """``device`` (a torch device or its name) runs the keypoint visibility ray casts; the
+        default is CUDA if available."""
         self.df = data
         self.mesh = mesh
         self.margin = margin
         self.keypoints = keypoints
         self.heatmap_sigma = heatmap_sigma
-        self.visibility = self._compute_visibility()
+        self.visibility = self._compute_visibility(device)
 
     def _keypoint_positions(self) -> np.ndarray:
         return np.stack([kp.position for kp in self.keypoints], axis=0).astype(np.float32)
 
-    def _compute_visibility(self) -> np.ndarray:
+    def _compute_visibility(self, device=None) -> np.ndarray:
         """Per-sample, per-keypoint visibility (in front, facing, unoccluded, projectable)."""
         points = self._keypoint_positions()
         normals = face_normals_at_points(self.mesh, points)
-        occluder = MeshOccluder(self.mesh)
+        occluder = MeshOccluder(self.mesh, device=device)
         visibility = np.zeros((len(self.df), len(points)), dtype=bool)
         rows = zip(self.df["pose"], self.df["distortion_coeffs"])
         for i, (pose, dist_coeffs) in enumerate(
@@ -439,8 +507,8 @@ class ImageKPHeatmapDataset(Dataset):
         )
         return visibility
 
-    def _load_image(self, row) -> torch.Tensor:
-        return read_image_tensor(row)
+    def _load_pixels(self, row) -> np.ndarray:
+        return read_pixels(row)
 
     def _build_kp_heatmaps(self, idx: int, row, box: Box, out_size: tuple[int, int]) -> torch.Tensor:
         """
@@ -473,10 +541,10 @@ class ImageKPHeatmapDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        image = self._load_image(row)
-        height, width = image.shape[-2:]
+        pixels = self._load_pixels(row)
+        height, width = pixels.shape[:2]
         heatmaps = self._build_kp_heatmaps(idx, row, (0, 0, width, height), (width, height))
-        return _as_rgb(image), heatmaps, self._rotation_target(row)
+        return _as_rgb(pixels_to_tensor(pixels)), heatmaps, self._rotation_target(row)
 
     @staticmethod
     def _rotation_target(row) -> torch.Tensor:
@@ -484,6 +552,9 @@ class ImageKPHeatmapDataset(Dataset):
 
 
 class ImageKPHeatmapROIDataset(ImageKPHeatmapDataset):
+    def __getstate__(self):
+        return {**self.__dict__, "_buffer": None}
+
     def __init__(
         self,
         data: pd.DataFrame,
@@ -498,8 +569,14 @@ class ImageKPHeatmapROIDataset(ImageKPHeatmapDataset):
         random_erasing: float = 0.0,
         symmetry=None,
         turn_weights: np.ndarray | None = None,
+        regions=None,
+        device=None,
     ):
         """
+        ``regions`` (an ``image_cache.KeypointRegionCache`` of ``data``) supplies the image parts
+        crops come from instead of decoding every frame each time: the same crops. ``device``
+        runs the keypoint visibility ray casts (default: CUDA if available).
+
         ``background`` (a ``masks.BackgroundCompositor``) replaces the scene around the object in
         some augmented crops; ``random_erasing`` is the share of augmented crops that get a random
         rectangle of noise, so no single part of the object is relied on. With ``symmetry`` (a
@@ -508,7 +585,11 @@ class ImageKPHeatmapROIDataset(ImageKPHeatmapDataset):
         ``turn_weights`` (one per row of ``data``, symmetry.twin_balance_weights) augmented items
         also carry their turn-loss weight; unaugmented (validation) items weigh 1.
         """
-        super().__init__(data, mesh, keypoints, margin=margin, heatmap_sigma=heatmap_sigma)
+        super().__init__(data, mesh, keypoints, margin=margin, heatmap_sigma=heatmap_sigma, device=device)
+        if regions is not None and len(regions.sizes) != len(data):
+            raise ValueError("The keypoint region cache is for other frames.")
+        self.regions = regions
+        self._buffer: torch.Tensor | None = None
         self.crop_size = crop_size
         self.augment = augment
         self.low_light = low_light
@@ -520,20 +601,31 @@ class ImageKPHeatmapROIDataset(ImageKPHeatmapDataset):
             T.RandomErasing(p=random_erasing, scale=(0.02, 0.12), ratio=(0.3, 3.3), value="random")
             if random_erasing > 0 else None
         )
+        # The same for whole batches on their device, for a trainer to apply in place of
+        # ``photometric`` and ``erasing`` (see with_augmentation).
+        self.batch_augmentation = BatchPhotometric(low_light=low_light, erasing=random_erasing)
+        self.batch_photometric = False
 
-    def with_augmentation(self, augment: bool) -> "ImageKPHeatmapROIDataset":
-        """Shallow copy sharing the loaded data, with ROI jitter and colour/blur augmentation on or off."""
+    def with_augmentation(self, augment: bool, batch_photometric: bool = False) -> "ImageKPHeatmapROIDataset":
+        """Shallow copy sharing the loaded data, with ROI jitter and colour/blur augmentation on or off.
+        With ``batch_photometric``, the colour jitter, blur, low light and random erasing are left
+        to ``batch_augmentation``, for the trainer to apply to whole batches."""
         dataset = copy.copy(self)
         dataset.augment = augment
+        dataset.batch_photometric = batch_photometric
         return dataset
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        image = self._load_image(row)
-        height, width = image.shape[-2:]
+        pixels, origin = None, (0, 0)
+        if self.regions is not None:
+            pixels, origin, (height, width) = self.regions.get(idx)
+        else:
+            pixels = self._load_pixels(row)
+            height, width = pixels.shape[:2]
 
         roi = _get_2d_roi(
-            image.shape,
+            (height, width),
             self.mesh,
             row["pose"],
             row["camera_intrinsics"],
@@ -543,13 +635,27 @@ class ImageKPHeatmapROIDataset(ImageKPHeatmapDataset):
         if self.augment:
             roi = _jitter_roi(roi)
         box = crop_box(roi, height, width)
-        crop = crop_and_resize(image, box, self.crop_size)
+        x1, y1, x2, y2 = box
+        ox, oy = origin
+        if not (ox <= x1 and oy <= y1 and x2 <= ox + pixels.shape[1] and y2 <= oy + pixels.shape[0]):
+            # Outside the cached region (not expected): decode the image as without a cache.
+            pixels, (ox, oy) = self._load_pixels(row), (0, 0)
+        # Only the box is converted to float (the same values as cropping the converted image),
+        # into memory reused from sample to sample: a large box costs more to allocate afresh.
+        box_pixels = pixels[y1 - oy:y2 - oy, x1 - ox:x2 - ox]
+        channels = 1 if box_pixels.ndim == 2 else box_pixels.shape[2]
+        size = channels * (y2 - y1) * (x2 - x1)
+        if self._buffer is None or self._buffer.numel() < size:
+            self._buffer = torch.empty(size, dtype=torch.float32)
+        box_image = pixels_to_tensor(box_pixels, self._buffer[:size].view(channels, y2 - y1, x2 - x1))
+        crop = crop_and_resize(box_image, (0, 0, x2 - x1, y2 - y1), self.crop_size)
         if self.augment:
             if self.background is not None:
                 crop = self.background(crop, row, box)
-            crop = _apply_photometric(self.photometric, crop, self.low_light)
-            if self.erasing is not None:
-                crop = self.erasing(crop)
+            if not self.batch_photometric:
+                crop = _apply_photometric(self.photometric, crop, self.low_light)
+                if self.erasing is not None:
+                    crop = self.erasing(crop)
         heatmaps = self._build_kp_heatmaps(idx, row, box, (self.crop_size, self.crop_size))
         rotation = self._rotation_target(row)
         if self.symmetry is not None:
@@ -725,11 +831,12 @@ class DataLoader:
         margin: float = 1.4,
         input_size: tuple[int, int] = ROI_INPUT_SIZE,
         low_light: float = 0.0,
+        cache=None,
     ):
-        return ImageROIDataset(self.data, self.mesh, margin=margin, input_size=input_size, low_light=low_light)
+        return ImageROIDataset(self.data, self.mesh, margin=margin, input_size=input_size, low_light=low_light, cache=cache)
 
-    def get_kp_heatmap_dataset(self, keypoints: list[CanonicalKeypoint], margin: float = 1.4):
-        return ImageKPHeatmapDataset(self.data, self.mesh, keypoints, margin=margin)
+    def get_kp_heatmap_dataset(self, keypoints: list[CanonicalKeypoint], margin: float = 1.4, device=None):
+        return ImageKPHeatmapDataset(self.data, self.mesh, keypoints, margin=margin, device=device)
 
     def get_kp_heatmap_roi_dataset(
         self,
@@ -741,6 +848,8 @@ class DataLoader:
         random_erasing: float = 0.0,
         symmetry=None,
         turn_weights: np.ndarray | None = None,
+        regions=None,
+        device=None,
     ):
         return ImageKPHeatmapROIDataset(
             self.data,
@@ -753,6 +862,8 @@ class DataLoader:
             random_erasing=random_erasing,
             symmetry=symmetry,
             turn_weights=turn_weights,
+            regions=regions,
+            device=device,
         )
 
 

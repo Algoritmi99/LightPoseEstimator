@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 from torchvision.models import mobilenet_v3_small
 
+from ..devices import resolve_device
 from .roi import ROI
 
 # Default (width, height) the detector resizes every image to. Boxes are predicted in
@@ -69,8 +70,11 @@ class ROIDetector(nn.Module):
         self.__backbone_frozen = False
 
     @classmethod
-    def load(cls, path: str | Path, input_size: tuple[int, int] = ROI_INPUT_SIZE) -> "ROIDetector":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def load(
+        cls, path: str | Path, input_size: tuple[int, int] = ROI_INPUT_SIZE, device: str | torch.device | None = None
+    ) -> "ROIDetector":
+        """The detector saved at ``path``, on ``device`` (default: CUDA if available)."""
+        device = resolve_device(device)
         model = cls(input_size=input_size)
         model.load_state_dict(
             torch.load(path, map_location=device, weights_only=True)

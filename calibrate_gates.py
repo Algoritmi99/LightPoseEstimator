@@ -25,6 +25,7 @@ def parse_args():
         default=DEFAULT_KEEP_FRACTION,
         help="Share of good validation poses each check must keep (default: %(default)s).",
     )
+    parser.add_argument("--device", default=None, help="e.g. cpu or cuda (default: cuda if available).")
     return parser.parse_args()
 
 
@@ -39,7 +40,7 @@ def main():
         recenter_mesh=config.get("recenter_mesh"),
     )
     loader.exclude_recordings(config.get("exclude_recordings", []))
-    calibrate_run(args.run_dir, loader, keep_fraction=args.keep_fraction)
+    calibrate_run(args.run_dir, loader, keep_fraction=args.keep_fraction, device=args.device)
 
 
 if __name__ == "__main__":

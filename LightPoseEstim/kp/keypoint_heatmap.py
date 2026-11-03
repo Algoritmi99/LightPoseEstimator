@@ -7,6 +7,7 @@ from torch import nn
 from torchvision.models import mobilenet_v3_small
 
 from ..crop import HEATMAP_STRIDE
+from ..devices import resolve_device
 
 DEFAULT_PEAK_THRESHOLD = 0.3
 _HEATMAP_PRIOR_BIAS = -2.19  # sigmoid ~ 0.1 at init, as in CenterNet
@@ -102,8 +103,11 @@ class KeypointHeatmapNet(nn.Module):
         return [deepest[s][0] for s in strides], [deepest[s][1] for s in strides]
 
     @classmethod
-    def load(cls, path: str | Path, num_keypoints: int, num_turns: int = 0) -> "KeypointHeatmapNet":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def load(
+        cls, path: str | Path, num_keypoints: int, num_turns: int = 0, device: str | torch.device | None = None
+    ) -> "KeypointHeatmapNet":
+        """The net saved at ``path``, on ``device`` (default: CUDA if available)."""
+        device = resolve_device(device)
         model = cls(num_keypoints=num_keypoints, num_turns=num_turns)
         model.load_state_dict(
             torch.load(path, map_location=device, weights_only=True)

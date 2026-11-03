@@ -223,6 +223,9 @@ python train.py --dataset data/Astrobee --epochs 30
 Each network trains in one stage with the whole model unfrozen, at `--lr` (default 1e-3)
 decaying to 0 over `--epochs`, and stops early after `--patience` epochs without a better
 validation loss. `--seed` fixes keypoint selection and initialisation, so runs are comparable.
+Training runs on the GPU when CUDA is available; `--device` picks another (`cpu`, `cuda:1`).
+The same holds across the package: every script with `--device`, and every class or function
+with a `device` argument, uses CUDA when it is available unless told otherwise.
 `--low-light-augmentation 0.3` darkens that share of training images to simulate poor
 lighting; it is off by default because on EO-1 it did not help dim frames and cost some accuracy.
 
@@ -234,6 +237,22 @@ than unseen ones with a plain background. The object's silhouette comes from the
 frame's labelled pose; masks and patches are rendered once into `--cache-dir` (default `cache/`;
 about 85 MB of masks and 190 MB of patches for 19k frames) and reused. `--random-erasing 0.3`
 puts a random rectangle of noise over that share of keypoint crops.
+
+`--cache-images` decodes every image once instead of every epoch, for datasets whose images
+decode slower than the networks train and leave the GPU waiting (EO-1's 2048x2048 PNGs). It keeps
+what each network needs in memory-mapped files under `--cache-dir`, which the OS holds in RAM,
+shared by all loader workers: the ROI detector's resized inputs, and the full-resolution part of
+each frame that keypoint crops can come from (their randomly moved and scaled boxes included).
+Training sees exactly the same data. For EO-1's 5000 frames that is about 26 GB, built in a
+minute or two and reused while the images, labels and settings stay the same.
+
+When training on a GPU, the colour jitter, blur, simulated low light and random erasing are
+applied there, to each training batch once the loader workers hand it over, not to each image in
+the workers. Every image still gets its own random draws from the same distributions as the
+torchvision transforms they replace. On EO-1's 384 px colour keypoint crops they were about 60%
+of the workers' CPU time (the hue jitter converts every crop to HSV and back), enough to leave
+the GPU waiting. `--cpu-augmentation` applies them in the workers instead, as does training on
+the CPU.
 
 Data is split by recording, not by frame, so near-identical neighbouring frames never land
 in both training and validation. By default 70% of recordings train, 15% validate (checkpoint

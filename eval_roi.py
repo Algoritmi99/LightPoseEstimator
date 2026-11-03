@@ -29,6 +29,7 @@ def parse_args():
         action="store_true",
         help="Do not translate mesh so its bbox center is at the origin.",
     )
+    parser.add_argument("--device", default=None, help="e.g. cpu or cuda (default: cuda if available).")
     return parser.parse_args()
 
 
@@ -36,7 +37,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args()
 
-    model = ROIDetector.load(args.model)
+    model = ROIDetector.load(args.model, device=args.device)
     device = next(model.parameters()).device
 
     loader = DataLoader(

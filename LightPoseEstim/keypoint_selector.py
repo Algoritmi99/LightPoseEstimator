@@ -210,7 +210,10 @@ class MeshKeypointSelector:
         min_visibility: float = 0.08,
         min_external_visibility: float = 0.15,
         random_seed: Optional[int] = None,
+        device=None,
     ) -> None:
+        """``device`` (a torch device or its name) runs the visibility ray casts; the default is
+        CUDA if available."""
         self.candidate_count = int(candidate_count)
         self.final_keypoint_count = int(final_keypoint_count)
         self.num_viewpoints = int(num_viewpoints)
@@ -218,6 +221,7 @@ class MeshKeypointSelector:
         self.min_visibility = float(min_visibility)
         self.min_external_visibility = float(min_external_visibility)
         self.rng = np.random.default_rng(random_seed)
+        self.device = device
 
     def select_keypoints(
         self,
@@ -235,7 +239,7 @@ class MeshKeypointSelector:
         if k_final <= 0:
             raise ValueError("keypoint_count must be > 0")
 
-        occluder = MeshOccluder(mesh)
+        occluder = MeshOccluder(mesh, device=self.device)
 
         candidates = self._sample_candidates(mesh, self.candidate_count)
         visibility_ratio, stability_ratio = self._simulate_coverage(
@@ -353,7 +357,7 @@ class MeshKeypointSelector:
             neighbor_indices=neighbor_indices,
             local_curvature=self._local_curvature(flat, neighbor_indices),
         )
-        occluder = MeshOccluder(mesh)
+        occluder = MeshOccluder(mesh, device=self.device)
         visibility_ratio, stability_ratio = self._simulate_coverage(mesh, pool, occluder)
         external = self._estimate_external_surface_visibility(mesh, pool, occluder)
         del occluder

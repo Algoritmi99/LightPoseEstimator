@@ -79,14 +79,16 @@ def calibrate_run(
     loader: DataLoader,
     keep_fraction: float = DEFAULT_KEEP_FRACTION,
     part: str = "val",
+    device=None,
 ) -> dict:
-    """Calibrate a run's quality checks on its ``part`` frames and store them in its config."""
+    """Calibrate a run's quality checks on its ``part`` frames and store them in its config,
+    running the networks on ``device`` (default: CUDA if available)."""
     config_path = Path(run_dir) / RUN_CONFIG_RELATIVE
     config = json.loads(config_path.read_text())
     split = RecordingSplit.from_dict(config["split"])
     rows = loader.data.iloc[split.indices(loader.data, part)]
     first = rows.iloc[0]
-    estimator = PoseEstimator.load_run(run_dir, first["camera_intrinsics"], first["distortion_coeffs"])
+    estimator = PoseEstimator.load_run(run_dir, first["camera_intrinsics"], first["distortion_coeffs"], device=device)
     frames = (
         (read_image(row), row["pose"], row["camera_intrinsics"], row["distortion_coeffs"])
         for _, row in tqdm(rows.iterrows(), total=len(rows), desc="Calibrating checks", unit="frame")

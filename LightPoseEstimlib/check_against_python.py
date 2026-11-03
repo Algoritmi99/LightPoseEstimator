@@ -6,7 +6,7 @@ measured, the twin reported).
 
 By default the Python side runs the exported network packages, as the C++ side does, so what
 differs is the geometry around them (and the OpenCV version); --networks pytorch compares with
-the PyTorch networks instead.
+the PyTorch networks instead. Both sides run on the device the export is compiled for.
 
     python LightPoseEstimlib/check_against_python.py --run-dir pose_estimator_astrobee_sym3_30 \
         --export-dir export_sym3_cpu --binary LightPoseEstimlib/build/main \
@@ -142,7 +142,8 @@ def main():
     data = loader.data
     recordings = args.recordings or list(RecordingSplit.from_dict(config["split"]).test)
     first = data[data.recording == recordings[0]].iloc[0]
-    base = PoseEstimator.load_run(args.run_dir, first["camera_intrinsics"], first["distortion_coeffs"], device=torch.device("cpu"))
+    device = json.loads((args.export_dir / "pose_estimator.json").read_text())["device"]
+    base = PoseEstimator.load_run(args.run_dir, first["camera_intrinsics"], first["distortion_coeffs"], device=device)
     if args.networks == "packages":
         use_packages(base, args.export_dir)
 

@@ -17,7 +17,8 @@ from .keypoint_selector import (
     paths_from_keypoint_run_dir,
 )
 from .crop import crop_and_resize, crop_box, crop_to_image
-from .dataloader import BAYER_TO_GRAY
+from .bayer import BAYER_TO_GRAY
+from .devices import resolve_device
 from .kp.keypoint_heatmap import DEFAULT_PEAK_THRESHOLD, KeypointHeatmapNet
 from .pose import Pose
 from .projection import as_dist_coeffs, project_points, projectable_mask, ray_rotation
@@ -177,11 +178,7 @@ class PoseEstimator:
         # track()'s state: the twins followed so far (a tracking.TurnTracker) and its settings.
         self._tracker = None
         self._tracker_settings: dict = {}
-        self.device = (
-            device
-            if device is not None
-            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        )
+        self.device = resolve_device(device)
         self.to_tensor = ToTensor()
         self.roi_detector.to(self.device).eval()
         self.keypoint_net.to(self.device).eval()
@@ -224,12 +221,14 @@ class PoseEstimator:
         elif keypoints_path is not None:
             raise ValueError("Provide only one of keypoints or keypoints_path.")
         symmetry = KeypointSymmetry.from_keypoints(keypoints)
+        device = resolve_device(device)
         return cls(
-            roi_detector=ROIDetector.load(roi_detector_path, input_size=roi_input_size),
+            roi_detector=ROIDetector.load(roi_detector_path, input_size=roi_input_size, device=device),
             keypoint_net=KeypointHeatmapNet.load(
                 keypoint_net_path,
                 num_keypoints=len(keypoints),
                 num_turns=len(symmetry.turns) if symmetry is not None else 0,
+                device=device,
             ),
             keypoints=keypoints,
             camera_intrinsics=camera_intrinsics,

@@ -26,6 +26,8 @@ from LightPoseEstim.dataloader import (
 from LightPoseEstim.kp import KeypointHeatmapNet, KeypointLoss, SymmetricKeypointLoss
 from LightPoseEstim.masks import BackgroundCompositor, build_background_pool, build_mask_cache
 from LightPoseEstim.projection import allocentric_rotation
+from LightPoseEstim.devices import resolve_device
+from LightPoseEstim.image_cache import build_keypoint_region_cache, build_roi_input_cache
 from LightPoseEstim.symmetry import KeypointSymmetry, TurnDistinctness, choose_reference, twin_balance_weights
 from LightPoseEstim.calibration import DEFAULT_KEEP_FRACTION, calibrate_run
 from LightPoseEstim.keypoint_selector import KEYPOINTS_FILENAME, KEYPOINTS_SUBDIR, NET_SUBDIR
@@ -233,6 +235,31 @@ def parse_args():
         ),
     )
     training.add_argument(
+        "--device",
+        default=None,
+        help="Device to train on, e.g. cpu, cuda or cuda:1 (default: cuda if available, else cpu).",
+    )
+    training.add_argument(
+        "--cpu-augmentation",
+        action="store_true",
+        help=(
+            "Apply the photometric augmentation (colour jitter, blur, low light, random erasing) to "
+            "each image in the loader workers instead of to each training batch on the GPU, which "
+            "is the default when training on one. Same distributions either way; on colour images "
+            "the CPU route can leave the GPU waiting."
+        ),
+    )
+    training.add_argument(
+        "--cache-images",
+        action="store_true",
+        help=(
+            "Decode every image once, into memory-mapped files under --cache-dir that the OS keeps "
+            "in RAM (the ROI detector's inputs, and the image parts keypoint crops come from), "
+            "instead of every epoch: for large images whose decoding leaves the GPU waiting, such "
+            "as EO-1's 2048x2048 PNGs (about 26 GB for its 5000 frames). Training sees the same data."
+        ),
+    )
+    training.add_argument(
         "--cache-dir",
         type=Path,
         default=DEFAULT_CACHE_DIR,
@@ -344,9 +371,13 @@ def oversampling_weights(recordings, specs: list[str]) -> np.ndarray:
     return weights
 
 
+def dataset_cache_key(args) -> str:
+    return f"{args.dataset.resolve().name}-{hashlib.sha1(str(args.dataset.resolve()).encode()).hexdigest()[:8]}"
+
+
 def background_compositor(loader, split: RecordingSplit, args) -> BackgroundCompositor:
     """Object masks for every frame, and background patches from training frames only."""
-    dataset_key = f"{args.dataset.resolve().name}-{hashlib.sha1(str(args.dataset.resolve()).encode()).hexdigest()[:8]}"
+    dataset_key = dataset_cache_key(args)
     mask_dir = build_mask_cache(loader.data, loader.mesh, args.cache_dir / "masks" / dataset_key, args.workers)
     train_rows = loader.data.iloc[split.indices(loader.data, "train")].reset_index(drop=True)
     split_key = hashlib.sha1("\n".join(split.train).encode()).hexdigest()[:10]
@@ -390,6 +421,16 @@ def main():
         loader.recenter_mesh,
         *roi_input_size,
     )
+    device = resolve_device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise SystemExit(f"--device {args.device}: CUDA is not available.")
+    # The photometric augmentation runs on whole batches on the GPU, unless told otherwise.
+    batch_augmentation = device.type == "cuda" and not args.cpu_augmentation
+    logging.info(
+        "Training on %s; photometric augmentation %s",
+        device,
+        "on the GPU, per batch" if batch_augmentation else "in the loader workers, per image",
+    )
     if args.balance_twins and not args.symmetric_keypoints:
         raise SystemExit("--balance-twins needs --symmetric-keypoints.")
     if args.symmetric_keypoints and args.keypoint_count % 4:
@@ -432,23 +473,29 @@ def main():
         args.roi_batch_size,
         args.workers,
     )
+    roi_cache = None
+    if args.cache_images:
+        roi_cache = build_roi_input_cache(loader.data, roi_input_size, args.cache_dir / "images" / dataset_cache_key(args), args.workers)
     ROIDetectorTrainer(
         loader.get_roi_dataset(
             margin=args.margin,
             input_size=roi_input_size,
             low_light=args.low_light_augmentation,
+            cache=roi_cache,
         ),
         model=ROIDetector(input_size=roi_input_size),
         batch_size=args.roi_batch_size,
         num_workers=args.workers,
         split=split,
+        device=device,
+        batch_augmentation=batch_augmentation,
         optimizer_kwargs=dict(lr=args.lr),
         use_tensorboard=use_tensorboard,
         tensorboard_log_dir=str(log_root / "roi"),
     ).train(args.epochs, save_path=str(roi_path), patience=args.patience)
 
     logging.info("Selecting canonical keypoints from the mesh")
-    selector = MeshKeypointSelector(final_keypoint_count=args.keypoint_count, random_seed=args.seed)
+    selector = MeshKeypointSelector(final_keypoint_count=args.keypoint_count, random_seed=args.seed, device=device)
     if args.symmetric_keypoints:
         keypoints = selector.select_symmetric_keypoints(loader.mesh, orbit_count=args.keypoint_count // 4)
     else:
@@ -499,6 +546,9 @@ def main():
             "training crops have views seen only as their own twin",
             weights.min(), weights.max(), *np.percentile(weights, [10, 90]), 100 * np.mean(share >= 0.95),
         )
+    regions = None
+    if args.cache_images:
+        regions = build_keypoint_region_cache(loader.data, loader.mesh, args.margin, args.cache_dir / "images" / dataset_cache_key(args), args.workers)
     kp_dataset = loader.get_kp_heatmap_roi_dataset(
         keypoints,
         crop_size=args.crop_size,
@@ -508,6 +558,8 @@ def main():
         random_erasing=args.random_erasing,
         symmetry=symmetry,
         turn_weights=turn_weights,
+        regions=regions,
+        device=device,
     )
 
     logging.info(
@@ -529,6 +581,8 @@ def main():
         batch_size=args.kp_batch_size,
         num_workers=args.workers,
         split=split,
+        device=device,
+        batch_augmentation=batch_augmentation,
         optimizer_kwargs=dict(lr=args.lr),
         use_tensorboard=use_tensorboard,
         tensorboard_log_dir=str(log_root / "keypoints"),
@@ -556,6 +610,7 @@ def main():
         "force_train": args.force_train,
         "oversample": args.oversample,
         "balance_twins": args.balance_twins,
+        "batch_augmentation": batch_augmentation,
         "excluded_recordings": excluded,
         "split_seed": args.split_seed,
         "split_from": str(args.split_from) if args.split_from is not None else None,
@@ -563,7 +618,7 @@ def main():
     }
     config_path.write_text(json.dumps(config, indent=2) + "\n")
     if args.gate_keep_fraction > 0:
-        calibrate_run(run_dir, loader, keep_fraction=args.gate_keep_fraction)
+        calibrate_run(run_dir, loader, keep_fraction=args.gate_keep_fraction, device=device)
     logging.info("Saved pose estimator run to %s", run_dir)
 
 
